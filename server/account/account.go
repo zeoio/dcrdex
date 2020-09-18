@@ -3,11 +3,12 @@ package account
 import (
 	"database/sql/driver"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
+	"decred.org/dcrdex/server/account/pki"
 	"github.com/decred/dcrd/crypto/blake256"
-	"github.com/decred/dcrd/dcrec/secp256k1"
-	"github.com/decred/dcrdex/server/account/pki"
+	"github.com/decred/dcrd/dcrec/secp256k1/v2"
 )
 
 var HashFunc = blake256.Sum256
@@ -31,6 +32,12 @@ func (aid AccountID) String() string {
 	return hex.EncodeToString(aid[:])
 }
 
+// MarshalJSON satisfies the json.Marshaller interface, and will marshal the
+// id to a hex string.
+func (aid AccountID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(aid.String())
+}
+
 // Value implements the sql/driver.Valuer interface.
 func (aid AccountID) Value() (driver.Value, error) {
 	return aid[:], nil // []byte
@@ -50,7 +57,6 @@ func (aid *AccountID) Scan(src interface{}) error {
 
 	return fmt.Errorf("cannot convert %T to AccountID", src)
 }
-
 
 // Account represents a dex client account.
 type Account struct {
@@ -76,3 +82,28 @@ func NewAccountFromPubKey(pk []byte) (*Account, error) {
 		PubKey: pubKey,
 	}, nil
 }
+
+// Rule represents a rule of community conduct.
+type Rule uint8
+
+const (
+	// NoRule indicates that no rules have been broken. This may be an invalid
+	// value in some contexts.
+	NoRule Rule = iota
+	// FailureToAct means that an account has not followed through on one of their
+	// swap negotiation steps.
+	FailureToAct
+	// CancellationRate means the account's cancellation rate  has dropped below
+	// the acceptable level.
+	CancellationRate
+	// LowFees means an account made a transaction that didn't pay fees at the
+	// requisite level.
+	LowFees
+	// PreimageReveal means an account failed to respond with a valid preimage
+	// for their order during epoch processing.
+	PreimageReveal
+	// MaxRule in not an actual rule. It is a placeholder that is used to
+	// determine the total number of rules. It must always be the last
+	// definition in this list.
+	MaxRule
+)

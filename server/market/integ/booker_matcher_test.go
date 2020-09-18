@@ -3,23 +3,24 @@
 package integ_test
 
 import (
-	"os"
+	"math/rand"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/decred/dcrdex/server/account"
-	"github.com/decred/dcrdex/server/book"
-	"github.com/decred/dcrdex/server/matcher"
-	"github.com/decred/dcrdex/server/order"
-	"github.com/decred/slog"
+	"decred.org/dcrdex/dex"
+	"decred.org/dcrdex/dex/order"
+	"decred.org/dcrdex/server/account"
+	"decred.org/dcrdex/server/book"
+	"decred.org/dcrdex/server/matcher"
 )
 
 // An arbitrary account ID for test orders.
 var acct0 = account.AccountID{
-	0x22, 0x4c, 0xba, 0xaa, 0xfa, 0x80, 0xbf, 0x3b, 0xd1, 0xff, 0x73, 0x15,
-	0x90, 0xbc, 0xbd, 0xda, 0x5a, 0x76, 0xf9, 0x1e, 0x60, 0xa1, 0x56, 0x99,
-	0x46, 0x34, 0xe9, 0x1c, 0xec, 0x25, 0xd5, 0x40,
+	0x22, 0x4c, 0xba, 0xaa, 0xfa, 0x80, 0xbf, 0x3b,
+	0xd1, 0xff, 0x73, 0x15, 0x90, 0xbc, 0xbd, 0xda,
+	0x5a, 0x76, 0xf9, 0x1e, 0x60, 0xa1, 0x56, 0x99,
+	0x46, 0x34, 0xe9, 0x1c, 0xec, 0x25, 0xd5, 0x40, // 32 bytes
 }
 
 const (
@@ -30,76 +31,124 @@ const (
 )
 
 func startLogger() {
-	logger := slog.NewBackend(os.Stdout).Logger("MATCHTEST - book")
-	logger.SetLevel(slog.LevelDebug)
+	logger := dex.StdOutLogger("MATCHTEST - book", dex.LevelTrace)
 	book.UseLogger(logger)
 
-	logger = slog.NewBackend(os.Stdout).Logger("MATCHTEST - matcher")
-	logger.SetLevel(slog.LevelDebug)
+	logger = dex.StdOutLogger("MATCHTEST - matcher", dex.LevelTrace)
 	matcher.UseLogger(logger)
+}
 
-	logger = slog.NewBackend(os.Stdout).Logger("MATCHTEST - order")
-	logger.SetLevel(slog.LevelDebug)
-	order.UseLogger(logger)
+func randomPreimage() (pe order.Preimage) {
+	rand.Read(pe[:])
+	return
 }
 
 func newLimitOrder(sell bool, rate, quantityLots uint64, force order.TimeInForce, timeOffset int64) *order.LimitOrder {
+	return newLimit(sell, rate, quantityLots, force, timeOffset).Order.(*order.LimitOrder)
+}
+
+func newLimit(sell bool, rate, quantityLots uint64, force order.TimeInForce, timeOffset int64) *matcher.OrderRevealed {
 	addr := "DcqXswjTPnUcd4FRCkX4vRJxmVtfgGVa5ui"
 	if sell {
 		addr = "149RQGLaHf2gGiL4NXZdH7aA8nYEuLLrgm"
 	}
-	return &order.LimitOrder{
-		MarketOrder: order.MarketOrder{
-			Prefix: order.Prefix{
+	pi := randomPreimage()
+	return &matcher.OrderRevealed{
+		Order: &order.LimitOrder{
+			P: order.Prefix{
 				AccountID:  acct0,
 				BaseAsset:  AssetDCR,
 				QuoteAsset: AssetBTC,
 				OrderType:  order.LimitOrderType,
 				ClientTime: time.Unix(1566497653+timeOffset, 0),
 				ServerTime: time.Unix(1566497656+timeOffset, 0),
+				Commit:     pi.Commit(),
 			},
-			UTXOs:    []order.Outpoint{},
-			Sell:     sell,
-			Quantity: quantityLots * LotSize,
-			Address:  addr,
+			T: order.Trade{
+				Coins:    []order.CoinID{},
+				Sell:     sell,
+				Quantity: quantityLots * LotSize,
+				Address:  addr,
+			},
+			Rate:  rate,
+			Force: force,
 		},
-		Rate:  rate,
-		Force: force,
+		Preimage: pi,
 	}
 }
 
 func newMarketSellOrder(quantityLots uint64, timeOffset int64) *order.MarketOrder {
-	return &order.MarketOrder{
-		Prefix: order.Prefix{
-			AccountID:  acct0,
-			BaseAsset:  AssetDCR,
-			QuoteAsset: AssetBTC,
-			OrderType:  order.MarketOrderType,
-			ClientTime: time.Unix(1566497653+timeOffset, 0),
-			ServerTime: time.Unix(1566497656+timeOffset, 0),
+	return newMarketSell(quantityLots, timeOffset).Order.(*order.MarketOrder)
+}
+
+func newMarketSell(quantityLots uint64, timeOffset int64) *matcher.OrderRevealed {
+	pi := randomPreimage()
+	return &matcher.OrderRevealed{
+		Order: &order.MarketOrder{
+			P: order.Prefix{
+				AccountID:  acct0,
+				BaseAsset:  AssetDCR,
+				QuoteAsset: AssetBTC,
+				OrderType:  order.MarketOrderType,
+				ClientTime: time.Unix(1566497653+timeOffset, 0),
+				ServerTime: time.Unix(1566497656+timeOffset, 0),
+				Commit:     pi.Commit(),
+			},
+			T: order.Trade{
+				Coins:    []order.CoinID{},
+				Sell:     true,
+				Quantity: quantityLots * LotSize,
+				Address:  "149RQGLaHf2gGiL4NXZdH7aA8nYEuLLrgm",
+			},
 		},
-		UTXOs:    []order.Outpoint{},
-		Sell:     true,
-		Quantity: quantityLots * LotSize,
-		Address:  "149RQGLaHf2gGiL4NXZdH7aA8nYEuLLrgm",
+		Preimage: pi,
 	}
 }
 
 func newMarketBuyOrder(quantityQuoteAsset uint64, timeOffset int64) *order.MarketOrder {
-	return &order.MarketOrder{
-		Prefix: order.Prefix{
-			AccountID:  acct0,
-			BaseAsset:  AssetDCR,
-			QuoteAsset: AssetBTC,
-			OrderType:  order.MarketOrderType,
-			ClientTime: time.Unix(1566497653+timeOffset, 0),
-			ServerTime: time.Unix(1566497656+timeOffset, 0),
+	return newMarketBuy(quantityQuoteAsset, timeOffset).Order.(*order.MarketOrder)
+}
+
+func newMarketBuy(quantityQuoteAsset uint64, timeOffset int64) *matcher.OrderRevealed {
+	pi := randomPreimage()
+	return &matcher.OrderRevealed{
+		Order: &order.MarketOrder{
+			P: order.Prefix{
+				AccountID:  acct0,
+				BaseAsset:  AssetDCR,
+				QuoteAsset: AssetBTC,
+				OrderType:  order.MarketOrderType,
+				ClientTime: time.Unix(1566497653+timeOffset, 0),
+				ServerTime: time.Unix(1566497656+timeOffset, 0),
+				Commit:     pi.Commit(),
+			},
+			T: order.Trade{
+				Coins:    []order.CoinID{},
+				Sell:     false,
+				Quantity: quantityQuoteAsset,
+				Address:  "DcqXswjTPnUcd4FRCkX4vRJxmVtfgGVa5ui",
+			},
 		},
-		UTXOs:    []order.Outpoint{},
-		Sell:     false,
-		Quantity: quantityQuoteAsset,
-		Address:  "DcqXswjTPnUcd4FRCkX4vRJxmVtfgGVa5ui",
+		Preimage: pi,
 	}
+}
+
+func newCancel(targetOrderID order.OrderID, serverTime time.Time) *matcher.OrderRevealed {
+	pi := randomPreimage()
+	return &matcher.OrderRevealed{
+		Order: &order.CancelOrder{
+			P: order.Prefix{
+				ServerTime: serverTime,
+				Commit:     pi.Commit(),
+			},
+			TargetOrderID: targetOrderID,
+		},
+		Preimage: pi,
+	}
+}
+
+func newCancelOrder(targetOrderID order.OrderID, serverTime time.Time) *order.CancelOrder {
+	return newCancel(targetOrderID, serverTime).Order.(*order.CancelOrder)
 }
 
 var (
@@ -152,10 +201,10 @@ func newBook(t *testing.T) *book.Book {
 
 func resetMakers() {
 	for _, o := range bookBuyOrders {
-		o.Filled = 0
+		o.FillAmt = 0
 	}
 	for _, o := range bookSellOrders {
-		o.Filled = 0
+		o.FillAmt = 0
 	}
 }
 
@@ -188,26 +237,32 @@ func TestMatchWithBook_limitsOnly(t *testing.T) {
 	// New matching engine.
 	me := matcher.New()
 
-	badLotsizeOrder := newLimitOrder(false, 05000000, 1, order.ImmediateTiF, 0)
-	badLotsizeOrder.Quantity /= 2
+	rand.Seed(0)
+
+	badLotsizeOrder := newLimit(false, 05000000, 1, order.ImmediateTiF, 0)
+	badLotsizeOrder.Order.(*order.LimitOrder).Quantity /= 2
 
 	// takers is heterogenous w.r.t. type
-	takers := []order.Order{
-		newLimitOrder(false, 4550000, 1, order.ImmediateTiF, 0), // buy, 1 lot, immediate, equal rate
-		newLimitOrder(false, 4550000, 2, order.StandingTiF, 0),  // buy, 2 lot, standing, equal rate, partial taker insert to book
-		newLimitOrder(false, 4550000, 2, order.ImmediateTiF, 0), // buy, 2 lot, immediate, equal rate, partial taker unfilled
-		newLimitOrder(false, 4100000, 1, order.ImmediateTiF, 0), // buy, 1 lot, immediate, unfilled fail
-		newLimitOrder(true, 4540000, 1, order.ImmediateTiF, 5),  // sell, 1 lot, immediate
-		newLimitOrder(true, 4300000, 4, order.ImmediateTiF, 0),  // sell, 4 lot, immediate, partial maker
+	takers := []*matcher.OrderRevealed{
+		newLimit(false, 4550000, 1, order.ImmediateTiF, 0), // buy, 1 lot, immediate, equal rate
+		newLimit(false, 4550000, 2, order.StandingTiF, 0),  // buy, 2 lot, standing, equal rate, partial taker insert to book
+		newLimit(false, 4550000, 2, order.ImmediateTiF, 0), // buy, 2 lot, immediate, equal rate, partial taker unfilled
+		newLimit(false, 4100000, 1, order.ImmediateTiF, 0), // buy, 1 lot, immediate, unfilled fail
+		newLimit(true, 4540000, 1, order.ImmediateTiF, 0),  // sell, 1 lot, immediate
+		newLimit(true, 4300000, 4, order.ImmediateTiF, 0),  // sell, 4 lot, immediate, partial maker
 	}
+
+	// tweak taker[4] commitment to get desired order.
+	takers[4].Preimage[0] += 0 // brute forced, could have required multiple bytes changed
+	takers[4].Order.(*order.LimitOrder).Commit = takers[4].Preimage.Commit()
 
 	resetTakers := func() {
 		for _, o := range takers {
-			switch ot := o.(type) {
+			switch ot := o.Order.(type) {
 			case *order.MarketOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			case *order.LimitOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			}
 		}
 	}
@@ -217,125 +272,152 @@ func TestMatchWithBook_limitsOnly(t *testing.T) {
 
 	type args struct {
 		book  *book.Book
-		queue []order.Order
+		queue []*matcher.OrderRevealed
 	}
 	tests := []struct {
-		name            string
-		args            args
-		doesMatch       bool
-		wantMatches     []*order.MatchSet
-		wantNumPassed   int
-		wantNumFailed   int
-		wantNumPartial  int
-		wantNumInserted int
+		name             string
+		args             args
+		doesMatch        bool
+		wantMatches      []*order.MatchSet
+		wantNumPassed    int
+		wantNumFailed    int
+		wantDoneOK       int
+		wantNumPartial   int
+		wantNumBooked    int
+		wantNumUnbooked  int
+		wantNumNomatched int
 	}{
 		{
 			name: "limit buy immediate rate match",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[0]},
+				queue: []*matcher.OrderRevealed{takers[0]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[0], []*order.LimitOrder{bookSellOrders[nSell-1]}),
+				newMatchSet(takers[0].Order, []*order.LimitOrder{bookSellOrders[nSell-1]}),
 			},
-			wantNumPassed:   1,
-			wantNumFailed:   0,
-			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumPassed:    1,
+			wantNumFailed:    0,
+			wantDoneOK:       1,
+			wantNumPartial:   0,
+			wantNumBooked:    0,
+			wantNumUnbooked:  1,
+			wantNumNomatched: 0,
 		},
 		{
 			name: "limit buy standing partial taker inserted to book",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[1]},
+				queue: []*matcher.OrderRevealed{takers[1]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[1], []*order.LimitOrder{bookSellOrders[nSell-1]}),
+				newMatchSet(takers[1].Order, []*order.LimitOrder{bookSellOrders[nSell-1]}),
 			},
-			wantNumPassed:   1,
-			wantNumFailed:   0,
-			wantNumPartial:  1,
-			wantNumInserted: 1,
+			wantNumPassed:    1,
+			wantNumFailed:    0,
+			wantDoneOK:       0,
+			wantNumPartial:   1,
+			wantNumBooked:    1,
+			wantNumUnbooked:  1,
+			wantNumNomatched: 0,
 		},
 		{
 			name: "limit buy immediate partial taker unfilled",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[2]},
+				queue: []*matcher.OrderRevealed{takers[2]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[2], []*order.LimitOrder{bookSellOrders[nSell-1]}),
+				newMatchSet(takers[2].Order, []*order.LimitOrder{bookSellOrders[nSell-1]}),
 			},
-			wantNumPassed:   1,
-			wantNumFailed:   0,
-			wantNumPartial:  1,
-			wantNumInserted: 0,
+			wantNumPassed:    1,
+			wantNumFailed:    0,
+			wantDoneOK:       1,
+			wantNumPartial:   1,
+			wantNumBooked:    0,
+			wantNumUnbooked:  1,
+			wantNumNomatched: 0,
 		},
 		{
 			name: "limit buy immediate unfilled fail",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[3]},
+				queue: []*matcher.OrderRevealed{takers[3]},
 			},
-			doesMatch:       false,
-			wantMatches:     nil,
-			wantNumPassed:   0,
-			wantNumFailed:   1,
-			wantNumPartial:  0,
-			wantNumInserted: 0,
+			doesMatch:        false,
+			wantMatches:      nil,
+			wantNumPassed:    0,
+			wantNumFailed:    1,
+			wantDoneOK:       0,
+			wantNumPartial:   0,
+			wantNumBooked:    0,
+			wantNumUnbooked:  0,
+			wantNumNomatched: 1,
 		},
 		{
 			name: "bad lot size order",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{badLotsizeOrder},
+				queue: []*matcher.OrderRevealed{badLotsizeOrder},
 			},
-			doesMatch:       false,
-			wantMatches:     nil,
-			wantNumPassed:   0,
-			wantNumFailed:   1,
-			wantNumPartial:  0,
-			wantNumInserted: 0,
+			doesMatch:        false,
+			wantMatches:      nil,
+			wantNumPassed:    0,
+			wantNumFailed:    1,
+			wantDoneOK:       0,
+			wantNumPartial:   0,
+			wantNumBooked:    0,
+			wantNumUnbooked:  0,
+			wantNumNomatched: 0,
 		},
 		{
 			name: "limit buy standing partial taker inserted to book, then filled by down-queue sell",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[1], takers[4]},
+				queue: []*matcher.OrderRevealed{takers[1], takers[4]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[1], []*order.LimitOrder{bookSellOrders[nSell-1]}),
+				newMatchSet(takers[1].Order, []*order.LimitOrder{bookSellOrders[nSell-1]}),
 				{ // the maker is reduced by matching first item in the queue
-					Taker:   takers[4],
-					Makers:  []*order.LimitOrder{takers[1].(*order.LimitOrder)},
+					Taker:   takers[4].Order,
+					Makers:  []*order.LimitOrder{takers[1].Order.(*order.LimitOrder)},
 					Amounts: []uint64{1 * LotSize}, // 2 - 1
 					Rates:   []uint64{4550000},
 					Total:   1 * LotSize,
 				},
 			},
-			wantNumPassed:   2,
-			wantNumFailed:   0,
-			wantNumPartial:  1,
-			wantNumInserted: 1,
+			wantNumPassed:    2,
+			wantNumFailed:    0,
+			wantDoneOK:       1,
+			wantNumPartial:   1,
+			wantNumBooked:    1,
+			wantNumUnbooked:  2,
+			wantNumNomatched: 0,
 		},
 		{
 			name: "limit sell immediate rate overlap",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[5]},
+				queue: []*matcher.OrderRevealed{takers[5]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[5], []*order.LimitOrder{bookBuyOrders[nBuy-1], bookBuyOrders[nBuy-2], bookBuyOrders[nBuy-3]}, 1*LotSize),
+				newMatchSet(
+					takers[5].Order,
+					[]*order.LimitOrder{bookBuyOrders[nBuy-1], bookBuyOrders[nBuy-2], bookBuyOrders[nBuy-3]},
+					1*LotSize),
 			},
-			wantNumPassed:   1,
-			wantNumFailed:   0,
-			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumPassed:    1,
+			wantNumFailed:    0,
+			wantDoneOK:       1,
+			wantNumPartial:   0,
+			wantNumBooked:    0,
+			wantNumUnbooked:  2,
+			wantNumNomatched: 0,
 		},
 	}
 	for _, tt := range tests {
@@ -344,7 +426,8 @@ func TestMatchWithBook_limitsOnly(t *testing.T) {
 			resetTakers()
 			resetMakers()
 
-			matches, passed, failed, partial, inserted := me.Match(tt.args.book, tt.args.queue)
+			// Ignore the seed since it is tested in the matcher unit tests.
+			_, matches, passed, failed, doneOK, partial, booked, nomatched, unbooked, _ := me.Match(tt.args.book, tt.args.queue)
 			matchMade := len(matches) > 0 && matches[0] != nil
 			if tt.doesMatch != matchMade {
 				t.Errorf("Match expected = %v, got = %v", tt.doesMatch, matchMade)
@@ -363,17 +446,36 @@ func TestMatchWithBook_limitsOnly(t *testing.T) {
 			if len(failed) != tt.wantNumFailed {
 				t.Errorf("number failed %d, expected %d", len(failed), tt.wantNumFailed)
 			}
+			if len(doneOK) != tt.wantDoneOK {
+				t.Errorf("number doneOK %d, expected %d", len(doneOK), tt.wantDoneOK)
+			}
 			if len(partial) != tt.wantNumPartial {
 				t.Errorf("number partial %d, expected %d", len(partial), tt.wantNumPartial)
 			}
-			if len(inserted) != tt.wantNumInserted {
-				t.Errorf("number inserted %d, expected %d", len(inserted), tt.wantNumInserted)
+			if len(booked) != tt.wantNumBooked {
+				t.Errorf("number booked %d, expected %d", len(booked), tt.wantNumBooked)
+			}
+			if len(unbooked) != tt.wantNumUnbooked {
+				t.Errorf("number unbooked %d, expected %d", len(unbooked), tt.wantNumUnbooked)
+			}
+
+			if len(nomatched) != tt.wantNumNomatched {
+				t.Errorf("number nomatched %d, expected %d", len(nomatched), tt.wantNumNomatched)
 			}
 		})
 	}
 }
 
-func orderInSlice(o order.Order, s []order.Order) int {
+func orderInSlice(o *matcher.OrderRevealed, s []*matcher.OrderRevealed) int {
+	for i := range s {
+		if s[i].Order.ID() == o.Order.ID() {
+			return i
+		}
+	}
+	return -1
+}
+
+func orderInLimitSlice(o order.Order, s []*order.LimitOrder) int {
 	for i := range s {
 		if s[i].ID() == o.ID() {
 			return i
@@ -389,82 +491,89 @@ func TestMatchWithBook_limitsOnly_multipleQueued(t *testing.T) {
 	// New matching engine.
 	me := matcher.New()
 
+	rand.Seed(0)
+
 	// epochQueue is heterogenous w.r.t. type
-	// var nonce int64
-	epochQueue := []order.Order{
+	epochQueue := []*matcher.OrderRevealed{
 		// buys
-		newLimitOrder(false, 4550000, 1, order.ImmediateTiF, 0), // 0: buy, 1 lot, immediate
-		newLimitOrder(false, 4550000, 2, order.StandingTiF, 0),  // 1: buy, 2 lot, standing
-		newLimitOrder(false, 4550000, 2, order.ImmediateTiF, 0), // 2: buy, 2 lot, immediate
-		newLimitOrder(false, 4100000, 1, order.ImmediateTiF, 0), // 3: buy, 1 lot, immediate
+		newLimit(false, 4550000, 1, order.ImmediateTiF, 0), // 0: buy, 1 lot, immediate
+		newLimit(false, 4550000, 2, order.StandingTiF, 0),  // 1: buy, 2 lot, standing
+		newLimit(false, 4550000, 2, order.ImmediateTiF, 0), // 2: buy, 2 lot, immediate
+		newLimit(false, 4100000, 1, order.ImmediateTiF, 0), // 3: buy, 1 lot, immediate
 		// sells
-		newLimitOrder(true, 4540000, 1, order.ImmediateTiF, 0),              // 4: sell, 1 lot, immediate
-		newLimitOrder(true, 4300000, 4, order.ImmediateTiF, 0),              // 5: sell, 4 lot, immediate
-		newLimitOrder(true, 4720000, 40, order.StandingTiF, 4726 /*nonce*/), // 6: sell, 40 lot, standing, unfilled insert
+		newLimit(true, 4540000, 1, order.ImmediateTiF, 0), // 4: sell, 1 lot, immediate
+		newLimit(true, 4300000, 4, order.ImmediateTiF, 0), // 5: sell, 4 lot, immediate
+		newLimit(true, 4720000, 40, order.StandingTiF, 0), // 6: sell, 40 lot, standing, unfilled insert
 	}
-	epochQueueInit := make([]order.Order, len(epochQueue))
+	epochQueue[0].Preimage = order.Preimage{
+		0xb1, 0xcb, 0x0a, 0xc8, 0xbf, 0x2b, 0xa9, 0xa7,
+		0x05, 0xf9, 0x6d, 0x6b, 0x68, 0x21, 0x28, 0x87,
+		0x13, 0x26, 0x23, 0x80, 0xfb, 0xe6, 0xb9, 0x0f,
+		0x74, 0x39, 0xc9, 0xf1, 0xcd, 0x6e, 0x02, 0xa8}
+	epochQueue[0].Order.(*order.LimitOrder).Commit = epochQueue[0].Preimage.Commit()
+	epochQueueInit := make([]*matcher.OrderRevealed, len(epochQueue))
 	copy(epochQueueInit, epochQueue)
 
-	/* brute force a nonce to make changing the test less horrible
-	// t.Log(epochQueue)
-	// matcher.ShuffleQueue(epochQueue)
+	/* //brute force a commitment to make changing the test less horrible
+	t.Log(epochQueue)
+	matcher.ShuffleQueue(epochQueue)
 
 	// Apply the shuffling to determine matching order that will be used.
 	wantOrder := []int{1, 6, 0, 3, 4, 5, 2}
-	var wantQueue []order.Order
+	var wantQueue []*matcher.OrderRevealed
 	for _, i := range wantOrder {
 		wantQueue = append(wantQueue, epochQueueInit[i])
 	}
 
-	queuesEqual := func(q1, q2 []order.Order) bool {
+	queuesEqual := func(q1, q2 []*matcher.OrderRevealed) bool {
 		if len(q1) != len(q2) {
 			return false
 		}
 		for i := range q1 {
-			if q1[i].(*order.LimitOrder) != q2[i].(*order.LimitOrder) {
+			if q1[i].Order.(*order.LimitOrder) != q2[i].Order.(*order.LimitOrder) {
 				return false
 			}
-			// if q1[i].ID() != q2[i].ID() {
-			// 	return false
-			// }
 		}
 		return true
 	}
 
-	lo6 := epochQueueInit[6].(*order.LimitOrder)
+	orderX := epochQueueInit[0]
+	loX := orderX.Order.(*order.LimitOrder)
+	var pi order.Preimage
+	var i int
 	for !queuesEqual(wantQueue, epochQueue) {
-		lo6.ClientTime = lo6.ClientTime.Add(time.Second)
-		lo6.ServerTime = lo6.ServerTime.Add(time.Second)
-		lo6.ClearID()
+		pi = randomPreimage()
+		orderX.Preimage = pi
+		loX.Commit = pi.Commit()
+		loX.SetTime(loX.ServerTime) // force recomputation of order ID
 		matcher.ShuffleQueue(epochQueue)
-		nonce++
+		i++
 	}
-	t.Logf("nonce: %d", nonce)
-	t.Log(epochQueue)
-	// NOTE: func (p *Prefix) ClearID() { p.id = nil }
+	t.Logf("preimage: %#v, commit: %#v", pi, loX.Commit)
+	t.Log(i, epochQueue)
 	*/
 
 	// -> Shuffles to [1, 6, 0, 3, 4, 5, 2]
 	// 1 -> partial match, inserted into book (passed, partial inserted)
-	// 6 -> inserted into book (partial, inserted)
-	// 0 -> is unfilled (failed)
-	// 3 -> is unfilled (failed)
+	// 6 -> unmatched, inserted into book (inserted, nomatched)
+	// 0 -> is unfilled (failed, nomatched)
+	// 3 -> is unfilled (failed, nomatched)
 	// 4 -> fills against order 1, which was just inserted (passed)
 	// 5 -> is filled (passed)
-	// 2 -> is unfilled (failed)
+	// 2 -> is unfilled (failed, nomatched)
 	// matches: [1, 4, 5], passed: [1, 4], failed: [0, 3, 2]
-	// partial: [1, 6], inserted: [1, 6]
+	// partial: [1], inserted: [1, 6], nomatched: [6, 0, 3, 2]
 
 	// order book from bookBuyOrders and bookSellOrders
 	b := newBook(t)
 
 	resetQueue := func() {
 		for _, o := range epochQueue {
-			switch ot := o.(type) {
+			switch ot := o.Order.(type) {
 			case *order.MarketOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			case *order.LimitOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			}
 		}
 	}
@@ -476,8 +585,9 @@ func TestMatchWithBook_limitsOnly_multipleQueued(t *testing.T) {
 	resetQueue()
 	resetMakers()
 
-	matches, passed, failed, partial, inserted := me.Match(b, epochQueue)
-	//t.Log(matches, passed, failed, partial, inserted)
+	// Ignore the seed since it is tested in the matcher unit tests.
+	_, matches, passed, failed, doneOK, partial, booked, nomatched, unbooked, _ := me.Match(b, epochQueue)
+	//t.Log(matches, passed, failed, doneOK, partial, booked, unbooked)
 
 	// PASSED orders
 
@@ -489,13 +599,15 @@ func TestMatchWithBook_limitsOnly_multipleQueued(t *testing.T) {
 		t.Errorf("Order not at expected location in passed slice: %d", loc)
 	}
 
-	// epoch order 5 should be order 1 in passed slice
-	expectedLoc = 1
+	// epoch order 5 should be order 2 in passed slice
+	expectedLoc = 2
 	if loc := orderInSlice(epochQueueInit[4], passed); loc == -1 {
 		t.Errorf("Order not in passed slice.")
 	} else if loc != expectedLoc {
 		t.Errorf("Order not at expected location in passed slice: %d", loc)
 	}
+
+	//t.Log(doneOK)
 
 	// FAILED orders
 
@@ -523,6 +635,14 @@ func TestMatchWithBook_limitsOnly_multipleQueued(t *testing.T) {
 		t.Errorf("Order not at expected location in failed slice: %d", loc)
 	}
 
+	// Done OK
+	expectedLoc = 1
+	if loc := orderInSlice(epochQueueInit[5], doneOK); loc == -1 {
+		t.Errorf("Order not in doneOK slice.")
+	} else if loc != expectedLoc {
+		t.Errorf("Order not at expected location in doneOK slice: %d", loc)
+	}
+
 	// PARTIAL fills
 
 	// epoch order 1 should be order 0 in partial slice
@@ -533,48 +653,56 @@ func TestMatchWithBook_limitsOnly_multipleQueued(t *testing.T) {
 		t.Errorf("Order not at expected location in partial slice: %d", loc)
 	}
 
-	// epoch order 6 should be order 1 in partial slice
-	expectedLoc = 1
-	if loc := orderInSlice(epochQueueInit[6], partial); loc == -1 {
-		t.Errorf("Order not in partial slice.")
-	} else if loc != expectedLoc {
-		t.Errorf("Order not at expected location in partial slice: %d", loc)
-	}
+	// BOOKED orders
 
-	// INSERTED orders
-
-	// epoch order 1 should be order 0 in inserted slice
+	// epoch order 1 should be order 0 in booked slice
 	expectedLoc = 0
-	if loc := orderInSlice(epochQueueInit[1], inserted); loc == -1 {
-		t.Errorf("Order not in inserted slice.")
+	if loc := orderInSlice(epochQueueInit[1], booked); loc == -1 {
+		t.Errorf("Order not in booked slice.")
 	} else if loc != expectedLoc {
-		t.Errorf("Order not at expected location in inserted slice: %d", loc)
+		t.Errorf("Order not at expected location in booked slice: %d", loc)
 	}
 
-	// epoch order 6 should be order 1 in inserted slice
+	// epoch order 6 should be order 1 in booked slice
 	expectedLoc = 1
-	if loc := orderInSlice(epochQueueInit[6], inserted); loc == -1 {
-		t.Errorf("Order not in inserted slice.")
+	if loc := orderInSlice(epochQueueInit[6], booked); loc == -1 {
+		t.Errorf("Order not in booked slice.")
 	} else if loc != expectedLoc {
-		t.Errorf("Order not at expected location in inserted slice: %d", loc)
+		t.Errorf("Order not at expected location in booked slice: %d", loc)
+	}
+
+	// epoch order 1 should be order 1 in unbooked slice
+	expectedLoc = 1
+	if loc := orderInLimitSlice(epochQueueInit[1].Order, unbooked); loc == -1 {
+		t.Errorf("Order not in unbooked slice.")
+	} else if loc != expectedLoc {
+		t.Errorf("Order not at expected location in unbooked slice: %d", loc)
+	}
+
+	// NOMATCHED orders
+
+	// We don't know the exact order, since there is an intermediate map used
+	// for tracking.
+	if len(nomatched) != 4 {
+		t.Errorf("Wrong number of nomatched orders. Wanted 4, got %d", len(nomatched))
+	} else {
+		for _, i := range []int{6, 0, 3, 2} {
+			if orderInSlice(epochQueueInit[i], nomatched) == -1 {
+				t.Errorf("Epoch queue order %d not in nomatched slice", i)
+			}
+		}
 	}
 
 	// epoch order 5 (sell, 4 lots, immediate @ 4300000) is match 1, matched
 	// with 3 orders, the first of which of which is epoch order 1 (buy, 2 lots,
-	// standing @ 4550000) that was inserted as a standing order.
-	if matches[1].Taker.ID() != epochQueueInit[4].ID() {
+	// standing @ 4550000) that was booked as a standing order.
+	if matches[1].Taker.ID() != epochQueueInit[4].Order.ID() {
 		t.Errorf("Taker order ID expected %v, got %v",
-			epochQueueInit[5].UID(), matches[1].Taker.UID())
+			epochQueueInit[5].Order.UID(), matches[1].Taker.UID())
 	}
-	if matches[1].Makers[0].ID() != epochQueueInit[1].ID() {
+	if matches[1].Makers[0].ID() != epochQueueInit[1].Order.ID() {
 		t.Errorf("First match was expected to be %v, got %v",
-			epochQueueInit[1].ID(), matches[1].Makers[0].ID())
-	}
-}
-
-func newCancelOrder(targetOrderID order.OrderID) *order.CancelOrder {
-	return &order.CancelOrder{
-		TargetOrderID: targetOrderID,
+			epochQueueInit[1].Order.ID(), matches[1].Makers[0].ID())
 	}
 }
 
@@ -585,12 +713,15 @@ func TestMatch_cancelOnly(t *testing.T) {
 	// New matching engine.
 	me := matcher.New()
 
+	rand.Seed(0)
+
 	fakeOrder := newLimitOrder(false, 4550000, 1, order.ImmediateTiF, 0)
+	fakeOrder.ServerTime = time.Unix(1566497654, 0)
 
 	// takers is heterogenous w.r.t. type
-	takers := []order.Order{
-		newCancelOrder(bookBuyOrders[3].ID()),
-		newCancelOrder(fakeOrder.ID()),
+	takers := []*matcher.OrderRevealed{
+		newCancel(bookBuyOrders[3].ID(), fakeOrder.ServerTime.Add(time.Second)),
+		newCancel(fakeOrder.ID(), fakeOrder.ServerTime.Add(time.Second)),
 	}
 
 	//nSell := len(bookSellOrders)
@@ -598,7 +729,7 @@ func TestMatch_cancelOnly(t *testing.T) {
 
 	type args struct {
 		book  *book.Book
-		queue []order.Order
+		queue []*matcher.OrderRevealed
 	}
 	tests := []struct {
 		name            string
@@ -607,36 +738,47 @@ func TestMatch_cancelOnly(t *testing.T) {
 		wantMatches     []*order.MatchSet
 		wantNumPassed   int
 		wantNumFailed   int
+		wantDoneOK      int
 		wantNumPartial  int
-		wantNumInserted int
+		wantNumBooked   int
+		wantNumUnbooked int
 	}{
 		{
 			name: "cancel standing ok",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[0]},
+				queue: []*matcher.OrderRevealed{takers[0]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				{Taker: takers[0], Makers: []*order.LimitOrder{bookBuyOrders[3]}},
+				{
+					Taker:   takers[0].Order,
+					Makers:  []*order.LimitOrder{bookBuyOrders[3]},
+					Amounts: []uint64{bookBuyOrders[3].Remaining()},
+					Rates:   []uint64{bookBuyOrders[3].Rate},
+				},
 			},
 			wantNumPassed:   1,
 			wantNumFailed:   0,
+			wantDoneOK:      1,
 			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumBooked:   0,
+			wantNumUnbooked: 1,
 		},
 		{
 			name: "cancel non-existent standing",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[1]},
+				queue: []*matcher.OrderRevealed{takers[1]},
 			},
 			doesMatch:       false,
 			wantMatches:     nil,
 			wantNumPassed:   0,
 			wantNumFailed:   1,
+			wantDoneOK:      0,
 			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumBooked:   0,
+			wantNumUnbooked: 0,
 		},
 	}
 	for _, tt := range tests {
@@ -653,7 +795,8 @@ func TestMatch_cancelOnly(t *testing.T) {
 
 			numBuys0 := tt.args.book.BuyCount()
 
-			matches, passed, failed, partial, inserted := me.Match(tt.args.book, tt.args.queue)
+			// Ignore the seed since it is tested in the matcher unit tests.
+			_, matches, passed, failed, doneOK, partial, booked, _, unbooked, _ := me.Match(tt.args.book, tt.args.queue)
 			matchMade := len(matches) > 0 && matches[0] != nil
 			if tt.doesMatch != matchMade {
 				t.Errorf("Match expected = %v, got = %v", tt.doesMatch, matchMade)
@@ -672,11 +815,17 @@ func TestMatch_cancelOnly(t *testing.T) {
 			if len(failed) != tt.wantNumFailed {
 				t.Errorf("number failed %d, expected %d", len(failed), tt.wantNumFailed)
 			}
+			if len(doneOK) != tt.wantDoneOK {
+				t.Errorf("number doneOK %d, expected %d", len(doneOK), tt.wantDoneOK)
+			}
 			if len(partial) != tt.wantNumPartial {
 				t.Errorf("number partial %d, expected %d", len(partial), tt.wantNumPartial)
 			}
-			if len(inserted) != tt.wantNumInserted {
-				t.Errorf("number inserted %d, expected %d", len(inserted), tt.wantNumInserted)
+			if len(booked) != tt.wantNumBooked {
+				t.Errorf("number booked %d, expected %d", len(booked), tt.wantNumBooked)
+			}
+			if len(unbooked) != tt.wantNumUnbooked {
+				t.Errorf("number unbooked %d, expected %d", len(unbooked), tt.wantNumUnbooked)
 			}
 
 			numBuys1 := tt.args.book.BuyCount()
@@ -694,24 +843,26 @@ func TestMatch_marketSellsOnly(t *testing.T) {
 	// New matching engine.
 	me := matcher.New()
 
-	badLotsizeOrder := newMarketSellOrder(1, 0)
-	badLotsizeOrder.Quantity /= 2
+	rand.Seed(0)
+
+	badLotsizeOrder := newMarketSell(1, 0)
+	badLotsizeOrder.Order.(*order.MarketOrder).Quantity /= 2
 
 	// takers is heterogenous w.r.t. type
-	takers := []order.Order{
-		newMarketSellOrder(1, 0),  // sell, 1 lot
-		newMarketSellOrder(3, 0),  // sell, 5 lot
-		newMarketSellOrder(5, 0),  // sell, 6 lot, partial maker fill
-		newMarketSellOrder(99, 0), // sell, 99 lot, partial taker fill
+	takers := []*matcher.OrderRevealed{
+		newMarketSell(1, 0),  // sell, 1 lot
+		newMarketSell(3, 0),  // sell, 5 lot
+		newMarketSell(5, 0),  // sell, 6 lot, partial maker fill
+		newMarketSell(99, 0), // sell, 99 lot, partial taker fill
 	}
 
 	resetTakers := func() {
 		for _, o := range takers {
-			switch ot := o.(type) {
+			switch ot := o.Order.(type) {
 			case *order.MarketOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			case *order.LimitOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			}
 		}
 	}
@@ -721,75 +872,106 @@ func TestMatch_marketSellsOnly(t *testing.T) {
 
 	type args struct {
 		book  *book.Book
-		queue []order.Order
+		queue []*matcher.OrderRevealed
 	}
 	tests := []struct {
-		name            string
-		args            args
-		doesMatch       bool
-		wantMatches     []*order.MatchSet
-		wantNumPassed   int
-		wantNumFailed   int
-		wantNumPartial  int
-		wantNumInserted int
+		name             string
+		args             args
+		doesMatch        bool
+		wantMatches      []*order.MatchSet
+		wantNumPassed    int
+		wantNumFailed    int
+		wantDoneOK       int
+		wantNumPartial   int
+		wantNumBooked    int
+		wantNumUnbooked  int
+		wantNumNomatched int
 	}{
 		{
 			name: "market sell, 1 maker match",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[0]},
+				queue: []*matcher.OrderRevealed{takers[0]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[0], []*order.LimitOrder{bookBuyOrders[nBuy-1]}),
+				newMatchSet(takers[0].Order, []*order.LimitOrder{bookBuyOrders[nBuy-1]}),
 			},
-			wantNumPassed:   1,
-			wantNumFailed:   0,
-			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumPassed:    1,
+			wantNumFailed:    0,
+			wantDoneOK:       1,
+			wantNumPartial:   0,
+			wantNumBooked:    0,
+			wantNumUnbooked:  1,
+			wantNumNomatched: 0,
 		},
 		{
 			name: "market sell, 2 maker match",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[1]},
+				queue: []*matcher.OrderRevealed{takers[1]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[1], []*order.LimitOrder{bookBuyOrders[nBuy-1], bookBuyOrders[nBuy-2]}),
+				newMatchSet(takers[1].Order, []*order.LimitOrder{bookBuyOrders[nBuy-1], bookBuyOrders[nBuy-2]}),
 			},
-			wantNumPassed:   1,
-			wantNumFailed:   0,
-			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumPassed:    1,
+			wantNumFailed:    0,
+			wantDoneOK:       1,
+			wantNumPartial:   0,
+			wantNumBooked:    0,
+			wantNumUnbooked:  2,
+			wantNumNomatched: 0,
 		},
 		{
 			name: "market sell, 2 maker match, partial maker fill",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[2]},
+				queue: []*matcher.OrderRevealed{takers[2]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[2], []*order.LimitOrder{bookBuyOrders[nBuy-1], bookBuyOrders[nBuy-2], bookBuyOrders[nBuy-3]}, 2*LotSize),
+				newMatchSet(takers[2].Order, []*order.LimitOrder{bookBuyOrders[nBuy-1], bookBuyOrders[nBuy-2], bookBuyOrders[nBuy-3]}, 2*LotSize),
 			},
-			wantNumPassed:   1,
-			wantNumFailed:   0,
-			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumPassed:    1,
+			wantNumFailed:    0,
+			wantDoneOK:       1,
+			wantNumPartial:   0,
+			wantNumBooked:    0,
+			wantNumUnbooked:  2,
+			wantNumNomatched: 0,
 		},
 		{
 			name: "market sell bad lot size",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{badLotsizeOrder},
+				queue: []*matcher.OrderRevealed{badLotsizeOrder},
 			},
-			doesMatch:       false,
-			wantMatches:     nil,
-			wantNumPassed:   0,
-			wantNumFailed:   1,
-			wantNumPartial:  0,
-			wantNumInserted: 0,
+			doesMatch:        false,
+			wantMatches:      nil,
+			wantNumPassed:    0,
+			wantNumFailed:    1,
+			wantDoneOK:       0,
+			wantNumPartial:   0,
+			wantNumBooked:    0,
+			wantNumUnbooked:  0,
+			wantNumNomatched: 0,
+		},
+		{
+			name: "market sell against empty book",
+			args: args{
+				book:  book.New(LotSize),
+				queue: []*matcher.OrderRevealed{takers[0]},
+			},
+			doesMatch:        false,
+			wantMatches:      nil,
+			wantNumPassed:    0,
+			wantNumFailed:    1,
+			wantDoneOK:       0,
+			wantNumPartial:   0,
+			wantNumBooked:    0,
+			wantNumUnbooked:  0,
+			wantNumNomatched: 1,
 		},
 	}
 	for _, tt := range tests {
@@ -800,7 +982,8 @@ func TestMatch_marketSellsOnly(t *testing.T) {
 
 			//fmt.Printf("%v\n", takers)
 
-			matches, passed, failed, partial, inserted := me.Match(tt.args.book, tt.args.queue)
+			// Ignore the seed since it is tested in the matcher unit tests.
+			_, matches, passed, failed, doneOK, partial, booked, nomatched, unbooked, _ := me.Match(tt.args.book, tt.args.queue)
 			matchMade := len(matches) > 0 && matches[0] != nil
 			if tt.doesMatch != matchMade {
 				t.Errorf("Match expected = %v, got = %v", tt.doesMatch, matchMade)
@@ -819,11 +1002,21 @@ func TestMatch_marketSellsOnly(t *testing.T) {
 			if len(failed) != tt.wantNumFailed {
 				t.Errorf("number failed %d, expected %d", len(failed), tt.wantNumFailed)
 			}
+			if len(doneOK) != tt.wantDoneOK {
+				t.Errorf("number doneOK %d, expected %d", len(doneOK), tt.wantDoneOK)
+			}
 			if len(partial) != tt.wantNumPartial {
 				t.Errorf("number partial %d, expected %d", len(partial), tt.wantNumPartial)
 			}
-			if len(inserted) != tt.wantNumInserted {
-				t.Errorf("number inserted %d, expected %d", len(inserted), tt.wantNumInserted)
+			if len(booked) != tt.wantNumBooked {
+				t.Errorf("number booked %d, expected %d", len(booked), tt.wantNumBooked)
+			}
+			if len(unbooked) != tt.wantNumUnbooked {
+				t.Errorf("number unbooked %d, expected %d", len(unbooked), tt.wantNumUnbooked)
+			}
+
+			if len(nomatched) != tt.wantNumNomatched {
+				t.Errorf("number nomatched %d, expected %d", len(nomatched), tt.wantNumNomatched)
 			}
 		})
 	}
@@ -868,24 +1061,26 @@ func TestMatch_marketBuysOnly(t *testing.T) {
 	// New matching engine.
 	me := matcher.New()
 
+	rand.Seed(0)
+
 	nSell := len(bookSellOrders)
 	//nBuy := len(bookBuyOrders)
 
 	// takers is heterogenous w.r.t. type
-	takers := []order.Order{
-		newMarketBuyOrder(quoteAmt(1), 0),  // buy, 1 lot
-		newMarketBuyOrder(quoteAmt(2), 0),  // buy, 2 lot
-		newMarketBuyOrder(quoteAmt(3), 0),  // buy, 3 lot
-		newMarketBuyOrder(quoteAmt(99), 0), // buy, up to 99 lots, computed exactly for the book
+	takers := []*matcher.OrderRevealed{
+		newMarketBuy(quoteAmt(1), 0),  // buy, 1 lot
+		newMarketBuy(quoteAmt(2), 0),  // buy, 2 lot
+		newMarketBuy(quoteAmt(3), 0),  // buy, 3 lot
+		newMarketBuy(quoteAmt(99), 0), // buy, up to 99 lots, computed exactly for the book
 	}
 
 	resetTakers := func() {
 		for _, o := range takers {
-			switch ot := o.(type) {
+			switch ot := o.Order.(type) {
 			case *order.MarketOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			case *order.LimitOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			}
 		}
 	}
@@ -897,7 +1092,7 @@ func TestMatch_marketBuysOnly(t *testing.T) {
 
 	type args struct {
 		book  *book.Book
-		queue []order.Order
+		queue []*matcher.OrderRevealed
 	}
 	tests := []struct {
 		name            string
@@ -907,72 +1102,85 @@ func TestMatch_marketBuysOnly(t *testing.T) {
 		remaining       []uint64
 		wantNumPassed   int
 		wantNumFailed   int
+		wantDoneOK      int
 		wantNumPartial  int
-		wantNumInserted int
+		wantNumBooked   int
+		wantNumUnbooked int
 	}{
 		{
 			name: "market buy, 1 maker match",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[0]},
+				queue: []*matcher.OrderRevealed{takers[0]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[0], []*order.LimitOrder{bookSellOrders[nSell-1]}),
+				newMatchSet(takers[0].Order, []*order.LimitOrder{bookSellOrders[nSell-1]}),
 			},
 			remaining:       []uint64{quoteAmt(1) - marketBuyQuoteAmt(1)},
 			wantNumPassed:   1,
 			wantNumFailed:   0,
+			wantDoneOK:      1,
 			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumBooked:   0,
+			wantNumUnbooked: 1,
 		},
 		{
 			name: "market buy, 2 maker match",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[1]},
+				queue: []*matcher.OrderRevealed{takers[1]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[1], []*order.LimitOrder{bookSellOrders[nSell-1], bookSellOrders[nSell-2]}, 1*LotSize),
+				newMatchSet(takers[1].Order,
+					[]*order.LimitOrder{bookSellOrders[nSell-1], bookSellOrders[nSell-2]},
+					1*LotSize),
 			},
 			remaining:       []uint64{0},
 			wantNumPassed:   1,
 			wantNumFailed:   0,
+			wantDoneOK:      1,
 			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumBooked:   0,
+			wantNumUnbooked: 1,
 		},
 		{
 			name: "market buy, 3 maker match",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[2]},
+				queue: []*matcher.OrderRevealed{takers[2]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[2], []*order.LimitOrder{bookSellOrders[nSell-1], bookSellOrders[nSell-2]}),
+				newMatchSet(takers[2].Order,
+					[]*order.LimitOrder{bookSellOrders[nSell-1], bookSellOrders[nSell-2]}),
 			},
 			remaining:       []uint64{0},
 			wantNumPassed:   1,
 			wantNumFailed:   0,
+			wantDoneOK:      1,
 			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumBooked:   0,
+			wantNumUnbooked: 2,
 		},
 		{
 			name: "market buy, 99 maker match",
 			args: args{
 				book:  newBook(t),
-				queue: []order.Order{takers[3]},
+				queue: []*matcher.OrderRevealed{takers[3]},
 			},
 			doesMatch: true,
 			wantMatches: []*order.MatchSet{
-				newMatchSet(takers[3], bookSellOrdersReverse),
+				newMatchSet(takers[3].Order, bookSellOrdersReverse),
 			},
 			remaining:       []uint64{0},
 			wantNumPassed:   1,
 			wantNumFailed:   0,
+			wantDoneOK:      1,
 			wantNumPartial:  0,
-			wantNumInserted: 0,
+			wantNumBooked:   0,
+			wantNumUnbooked: 11,
 		},
 	}
 	for _, tt := range tests {
@@ -981,7 +1189,8 @@ func TestMatch_marketBuysOnly(t *testing.T) {
 			resetTakers()
 			resetMakers()
 
-			matches, passed, failed, partial, inserted := me.Match(tt.args.book, tt.args.queue)
+			// Ignore the seed since it is tested in the matcher unit tests.
+			_, matches, passed, failed, doneOK, partial, booked, _, unbooked, _ := me.Match(tt.args.book, tt.args.queue)
 			matchMade := len(matches) > 0 && matches[0] != nil
 			if tt.doesMatch != matchMade {
 				t.Errorf("Match expected = %v, got = %v", tt.doesMatch, matchMade)
@@ -993,9 +1202,9 @@ func TestMatch_marketBuysOnly(t *testing.T) {
 				if !reflect.DeepEqual(matches[i], tt.wantMatches[i]) {
 					t.Errorf("matches[%d] = %v, want %v", i, matches[i], tt.wantMatches[i])
 				}
-				if matches[i].Taker.Remaining() != tt.remaining[i] {
+				if matches[i].Taker.Trade().Remaining() != tt.remaining[i] {
 					t.Errorf("Incorrect taker order amount remaining. Expected %d, got %d",
-						tt.remaining[i], matches[i].Taker.Remaining())
+						tt.remaining[i], matches[i].Taker.Trade().Remaining())
 				}
 			}
 			if len(passed) != tt.wantNumPassed {
@@ -1004,11 +1213,17 @@ func TestMatch_marketBuysOnly(t *testing.T) {
 			if len(failed) != tt.wantNumFailed {
 				t.Errorf("number failed %d, expected %d", len(failed), tt.wantNumFailed)
 			}
+			if len(doneOK) != tt.wantDoneOK {
+				t.Errorf("number doneOK %d, expected %d", len(doneOK), tt.wantDoneOK)
+			}
 			if len(partial) != tt.wantNumPartial {
 				t.Errorf("number partial %d, expected %d", len(partial), tt.wantNumPartial)
 			}
-			if len(inserted) != tt.wantNumInserted {
-				t.Errorf("number inserted %d, expected %d", len(inserted), tt.wantNumInserted)
+			if len(booked) != tt.wantNumBooked {
+				t.Errorf("number booked %d, expected %d", len(booked), tt.wantNumBooked)
+			}
+			if len(unbooked) != tt.wantNumUnbooked {
+				t.Errorf("number unbooked %d, expected %d", len(unbooked), tt.wantNumUnbooked)
 			}
 		})
 	}
@@ -1021,46 +1236,49 @@ func TestMatchWithBook_everything_multipleQueued(t *testing.T) {
 	// New matching engine.
 	me := matcher.New()
 
+	rand.Seed(12)
+
 	nSell := len(bookSellOrders)
 	nBuy := len(bookBuyOrders)
+	cancelTime := time.Unix(1566497655, 0)
 
 	// epochQueue is heterogenous w.r.t. type
-	epochQueue := []order.Order{
+	epochQueue := []*matcher.OrderRevealed{
 		// buys
-		newLimitOrder(false, 4550000, 1, order.ImmediateTiF, 0), // 0: buy, 1 lot, immediate
-		newLimitOrder(false, 4550000, 2, order.StandingTiF, 0),  // 1: buy, 2 lot, standing
-		newLimitOrder(false, 4550000, 2, order.ImmediateTiF, 0), // 2: buy, 2 lot, immediate
-		newLimitOrder(false, 4100000, 1, order.ImmediateTiF, 0), // 3: buy, 1 lot, immediate
+		newLimit(false, 4550000, 1, order.ImmediateTiF, 0), // 0: buy, 1 lot, immediate
+		newLimit(false, 4550000, 2, order.StandingTiF, 0),  // 1: buy, 2 lot, standing
+		newLimit(false, 4550000, 2, order.ImmediateTiF, 0), // 2: buy, 2 lot, immediate, unmatched
+		newLimit(false, 4100000, 1, order.ImmediateTiF, 0), // 3: buy, 1 lot, immediate, unmatched
 		// sells
-		newLimitOrder(true, 4540000, 1, order.ImmediateTiF, 0), // 4: sell, 1 lot, immediate
-		newLimitOrder(true, 4800000, 4, order.StandingTiF, 0),  // 5: sell, 4 lot, immediate
-		newLimitOrder(true, 4300000, 4, order.ImmediateTiF, 0), // 6: sell, 4 lot, immediate
-		newLimitOrder(true, 4800000, 40, order.StandingTiF, 0), // 7: sell, 40 lot, standing, unfilled insert
+		newLimit(true, 4540000, 1, order.ImmediateTiF, 0), // 4: sell, 1 lot, immediate
+		newLimit(true, 4800000, 4, order.StandingTiF, 0),  // 5: sell, 4 lot, immediate, unmatched
+		newLimit(true, 4300000, 4, order.ImmediateTiF, 0), // 6: sell, 4 lot, immediate
+		newLimit(true, 4800000, 40, order.StandingTiF, 1), // 7: sell, 40 lot, standing, unfilled insert
 		// market
-		newMarketSellOrder(2, 0),          // 8
-		newMarketSellOrder(4, 0),          // 9
-		newMarketBuyOrder(quoteAmt(1), 0), // 10
-		newMarketBuyOrder(quoteAmt(2), 0), // 11
+		newMarketSell(2, 0),          // 8
+		newMarketSell(4, 0),          // 9
+		newMarketBuy(quoteAmt(1), 0), // 10
+		newMarketBuy(quoteAmt(2), 0), // 11
 		// cancel
-		newCancelOrder(bookSellOrders[6].ID()),       // 12
-		newCancelOrder(bookBuyOrders[8].ID()),        // 13
-		newCancelOrder(bookBuyOrders[nBuy-1].ID()),   // 14
-		newCancelOrder(bookSellOrders[nSell-1].ID()), // 15
+		newCancel(bookSellOrders[6].ID(), cancelTime),       // 12
+		newCancel(bookBuyOrders[8].ID(), cancelTime),        // 13
+		newCancel(bookBuyOrders[nBuy-1].ID(), cancelTime),   // 14
+		newCancel(bookSellOrders[nSell-1].ID(), cancelTime), // 15
 	}
 	// cancel some the epoch queue orders too
-	epochQueue = append(epochQueue, newCancelOrder(epochQueue[7].ID())) // 16 misses
-	epochQueue = append(epochQueue, newCancelOrder(epochQueue[5].ID())) // 17 hits
+	epochQueue = append(epochQueue, newCancel(epochQueue[7].Order.ID(), cancelTime)) // 16 cancels 7 (miss)
+	epochQueue = append(epochQueue, newCancel(epochQueue[5].Order.ID(), cancelTime)) // 17 cancels 5 (miss)
 
-	epochQueueInit := make([]order.Order, len(epochQueue))
+	epochQueueInit := make([]*matcher.OrderRevealed, len(epochQueue))
 	copy(epochQueueInit, epochQueue)
 
 	// var shuf []int
 	// matcher.ShuffleQueue(epochQueue)
 	// for i := range epochQueue {
 	// 	for j := range epochQueueInit {
-	// 		if epochQueue[i].ID() == epochQueueInit[j].ID() {
+	// 		if epochQueue[i].Order.ID() == epochQueueInit[j].Order.ID() {
 	// 			shuf = append(shuf, j)
-	// 			t.Logf("%d: %p", j, epochQueueInit[j])
+	// 			t.Logf("%d: %p", j, epochQueueInit[j].Order)
 	// 			continue
 	// 		}
 	// 	}
@@ -1070,44 +1288,29 @@ func TestMatchWithBook_everything_multipleQueued(t *testing.T) {
 	// Apply the shuffling to determine matching order that will be used.
 	// matcher.ShuffleQueue(epochQueue)
 	// for i := range epochQueue {
-	// 	t.Logf("%d: %p, %p", i, epochQueueInit[i], epochQueue[i])
+	// 	t.Logf("%d: %p, %p", i, epochQueueInit[i].Order, epochQueue[i].Order)
 	// }
-	// Shuffles to [9, 5, 6, 2, 7, 17, 14, 10, 0, 3, 8, 13, 12, 15, 11, 4, 1, 16]
-	// 9  market sell 4 lots matches 1 @ 450, 3 @ 430 (passed)
-	// 5  limit sell unfilled insert (insert, partial)
-	// 6  limit sell 3 lots matches 3 @ 430 (partial)
-	// 2  limit buy 1 lot matches 1 @ 455 (partial)
-	// 7  limit sell unfilled insert (insert, partial)
-	// 17 cancel order for epoch order 5 just inserted hits (passed)
-	// 14 cancel misses because that order matched epoch order 6 already (failed)
-	// 10 market buy 1 lot fills 1 @ 460 (passed)
-	// 0  limit buy misses (failed)
-	// 3  limit buy misses (failed)
-	// 8  market sell 2 lots matches 2 @ 400 (passed)
-	// 13 cancel order misses because it's order matched already (failed)
-	// 12 cancel order matches (passed)
-	// 15 cancel order misses because it's order matched already (failed)
-	// 11 market buy 2 lots matches 1 @ 455, 1 @ 460 (passed)
-	// 4  limit sell 1 misses (failed)
-	// 1  limit buy 1 insert unfilled (partial, inserted)
-	// 16 cancels limit order order 7 (failed)
+	// Shuffles to [6, 13, 0, 14, 11, 10, 7, 1, 12, 5, 17, 4, 16, 2, 9, 8, 15, 3]
 
-	expectedNumMatches := 9
-	expectedPassed := []int{9, 6, 2, 17, 10, 8, 12, 11, 16}
-	expectedFailed := []int{14, 0, 3, 13, 15, 4}
-	expectedPartial := []int{5, 6, 2, 7, 1}
-	expectedInserted := []int{5, 7, 1} // all StandingTiF
+	expectedNumMatches := 11
+	expectedPassed := []int{5, 0, 8, 10, 13, 6, 17, 9, 7, 16, 12, 1, 4, 11}
+	expectedFailed := []int{15, 3, 2, 14}
+	expectedDoneOK := []int{0, 8, 10, 13, 6, 17, 9, 16, 12, 4, 11}
+	expectedPartial := []int{}
+	expectedBooked := []int{5, 7, 1} // all StandingTiF
+	expectedNumUnbooked := 8
+	expectedNumNomatched := 6
 
 	// order book from bookBuyOrders and bookSellOrders
 	b := newBook(t)
 
 	resetQueue := func() {
 		for _, o := range epochQueue {
-			switch ot := o.(type) {
+			switch ot := o.Order.(type) {
 			case *order.MarketOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			case *order.LimitOrder:
-				ot.Filled = 0
+				ot.FillAmt = 0
 			}
 		}
 	}
@@ -1116,15 +1319,48 @@ func TestMatchWithBook_everything_multipleQueued(t *testing.T) {
 	resetQueue()
 	resetMakers()
 
-	matches, passed, failed, partial, inserted := me.Match(b, epochQueue)
-	t.Log("Matches:", matches)
-	t.Log("Passed:", passed)
-	t.Log("Failed:", failed)
-	t.Log("Partial:", partial)
-	t.Log("Inserted:", inserted)
-	for i := range matches {
-		t.Log("Match", i, ":", matches[i])
-	}
+	// Ignore the seed since it is tested in the matcher unit tests.
+	_, matches, passed, failed, doneOK, partial, booked, nomatched, unbooked, _ := me.Match(b, epochQueue)
+	//t.Log("Matches:", matches)
+	// s := "Passed: "
+	// for _, o := range passed {
+	// 	s += fmt.Sprintf("%p ", o.Order)
+	// }
+	// t.Log(s)
+	// s = "Failed: "
+	// for _, o := range failed {
+	// 	s += fmt.Sprintf("%p ", o.Order)
+	// }
+	// t.Log(s)
+	// s = "DoneOK: "
+	// for _, o := range doneOK {
+	// 	s += fmt.Sprintf("%p ", o.Order)
+	// }
+	// t.Log(s)
+	// s = "Partial: "
+	// for _, o := range partial {
+	// 	s += fmt.Sprintf("%p ", o.Order)
+	// }
+	// t.Log(s)
+	// s = "Booked: "
+	// for _, o := range booked {
+	// 	s += fmt.Sprintf("%p ", o.Order)
+	// }
+	// t.Log(s)
+	// s := "Nomatched: "
+	// for _, o := range nomatched {
+	// 	s += fmt.Sprintf("%p ", o.Order)
+	// }
+	// t.Log(s)
+	// s = "Unbooked: "
+	// for _, o := range unbooked {
+	// 	s += fmt.Sprintf("%p ", o)
+	// }
+	// t.Log(s)
+
+	// for i := range matches {
+	// 	t.Logf("Match %d: %p, [%p, ...]", i, matches[i].Taker, matches[i].Makers[0])
+	// }
 
 	// PASSED orders
 
@@ -1142,6 +1378,13 @@ func TestMatchWithBook_everything_multipleQueued(t *testing.T) {
 		}
 	}
 
+	for i, qi := range expectedDoneOK {
+		if oi := orderInSlice(epochQueueInit[qi], doneOK); oi != i {
+			t.Errorf("Order not at expected location in doneOK slice. Got %d, expected %d",
+				oi, i)
+		}
+	}
+
 	for i, qi := range expectedPartial {
 		if oi := orderInSlice(epochQueueInit[qi], partial); oi != i {
 			t.Errorf("Order not at expected location in partial slice. Got %d, expected %d",
@@ -1149,24 +1392,34 @@ func TestMatchWithBook_everything_multipleQueued(t *testing.T) {
 		}
 	}
 
-	for i, qi := range expectedInserted {
-		if oi := orderInSlice(epochQueueInit[qi], inserted); oi != i {
-			t.Errorf("Order not at expected location in inserted slice. Got %d, expected %d",
+	for i, qi := range expectedBooked {
+		if oi := orderInSlice(epochQueueInit[qi], booked); oi != i {
+			t.Errorf("Order not at expected location in booked slice. Got %d, expected %d",
 				oi, i)
 		}
+	}
+
+	if len(unbooked) != expectedNumUnbooked {
+		t.Errorf("Incorrect number of unbooked orders. Got %d, expected %d", len(unbooked), expectedNumUnbooked)
+	}
+
+	if len(nomatched) != expectedNumNomatched {
+		t.Errorf("Incorrect number of nomatched orders. Got %d, expected %d", len(nomatched), expectedNumNomatched)
 	}
 
 	if len(matches) != expectedNumMatches {
 		t.Errorf("Incorrect number of matches. Got %d, expected %d", len(matches), expectedNumMatches)
 	}
 
-	// match 3 (epoch order 17) cancels epoch order 5
-	if matches[3].Taker.ID() != epochQueueInit[17].ID() {
+	// Spot check a couple of matches.
+
+	// match 4 (epoch order 6) cancels a book order
+	if matches[4].Taker.ID() != epochQueueInit[6].Order.ID() {
 		t.Errorf("Taker order ID expected %v, got %v",
-			epochQueueInit[17].UID(), matches[3].Taker.UID())
+			epochQueueInit[6].Order.UID(), matches[4].Taker.UID())
 	}
-	if matches[4].Taker.ID() != epochQueueInit[10].ID() {
-		t.Errorf("Fourth match take was expected to be %v, got %v",
-			epochQueueInit[10], matches[4].Taker.ID())
+	if matches[9].Makers[0].ID() != epochQueueInit[1].Order.ID() {
+		t.Errorf("9th match maker was expected to be %v, got %v",
+			epochQueueInit[1].Order.UID(), matches[9].Makers[0].ID())
 	}
 }

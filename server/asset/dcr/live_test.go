@@ -8,7 +8,7 @@
 // -----------------------------------
 // This command will check the UTXO paths by iterating backwards through
 // the transactions in the mainchain, starting with mempool, and requesting
-// all found outputs through the dcrBackend.utxo method. All utxos must be
+// all found outputs through the Backend.utxo method. All utxos must be
 // found or found to be spent.
 //
 // go test -v -tags dcrlive -run CacheAdvantage
@@ -19,11 +19,6 @@
 // ------------------------------------------
 // Monitor the block chain for a while and make sure that the block cache is
 // updating appropriately.
-//
-// go test -v -tags btclive -run LiveFees
-// ------------------------------------------
-// Test that fees rates are parsed without error and that a few historical fee
-// rates are correct.
 
 package dcr
 
@@ -32,45 +27,55 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"decred.org/dcrdex/dex"
+	dexdcr "decred.org/dcrdex/dex/networks/dcr"
 	"github.com/decred/dcrd/chaincfg/chainhash"
-	chainjson "github.com/decred/dcrd/rpc/jsonrpc/types"
+	chainjson "github.com/decred/dcrd/rpc/jsonrpc/types/v2"
 	"github.com/decred/dcrd/wire"
-	"github.com/decred/dcrdex/server/asset"
-	"github.com/decred/slog"
-	flags "github.com/jessevdk/go-flags"
 )
 
 var (
-	dcrdConfigPath = filepath.Join(dcrdHomeDir, "dcrd.conf")
-	dcr            *dcrBackend
-	testLogger     asset.Logger
+	dcr        *Backend
+	ctx        context.Context
+	testLogger dex.Logger
 )
 
-type dcrdConfig struct {
-	RPCUser string `short:"u" long:"rpcuser" description:"Username for RPC connections"`
-	RPCPass string `short:"P" long:"rpcpass" default-mask:"-" description:"Password for RPC connections"`
-}
-
 func TestMain(m *testing.M) {
-	testLogger = slog.NewBackend(os.Stdout).Logger("TEST")
-	ctx, shutdown := context.WithCancel(context.Background())
-	defer shutdown()
-	cfg := new(dcrdConfig)
-	err := flags.NewIniParser(flags.NewParser(cfg, flags.Default|flags.IgnoreUnknown)).ParseFile(dcrdConfigPath)
-	if err != nil {
-		fmt.Printf("error reading dcrd config: %v\n", err)
-		return
+	// Wrap everything for defers.
+	doIt := func() int {
+		logger := dex.StdOutLogger("DCRTEST", dex.LevelTrace)
+
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		defer func() {
+			logger.Infof("Shutting down...")
+			cancel()
+			wg.Wait()
+			logger.Infof("done.")
+		}()
+
+		var err error
+		dcr, err = NewBackend("", logger, dex.Testnet)
+		if err != nil {
+			fmt.Printf("NewBackend error: %v\n", err)
+			return 1
+		}
+
+		wg.Add(1)
+		go func() {
+			dcr.Run(ctx)
+			wg.Done()
+		}()
+
+		return m.Run()
 	}
-	dcr, err = NewBackend(ctx, "", testLogger, asset.Mainnet)
-	if err != nil {
-		fmt.Printf("NewBackend error: %v\n", err)
-		return
-	}
-	os.Exit(m.Run())
+
+	os.Exit(doIt())
 }
 
 // TestLiveUTXO will iterate the blockchain backwards, starting with mempool,
@@ -90,6 +95,7 @@ func TestLiveUTXO(t *testing.T) {
 		immatureBefore int
 		immatureAfter  int
 		utxoVal        uint64
+		feeRates       []uint64
 	}
 	stats := new(testStats)
 	var currentHeight, tipHeight int64
@@ -102,13 +108,13 @@ func TestLiveUTXO(t *testing.T) {
 		return *bestHash != *h
 	}
 
-	// Get the MsgTxs for the lsit of hashes.
+	// Get the MsgTxs for the list of hashes.
 	getMsgTxs := func(hashes []*chainhash.Hash) []*wire.MsgTx {
 		outTxs := make([]*wire.MsgTx, 0)
 		for _, h := range hashes {
 			newTx, err := dcr.client.GetRawTransaction(h)
 			if err != nil {
-				t.Fatalf("error retreiving MsgTx: %v", err)
+				t.Fatalf("error retrieving MsgTx: %v", err)
 				outTxs = append(outTxs, newTx.MsgTx())
 			}
 		}
@@ -146,41 +152,42 @@ func TestLiveUTXO(t *testing.T) {
 		txs = append(txs, txSet...)
 		for _, msgTx := range txSet {
 			txHash := msgTx.CachedTxHash()
+			fee := false
 			for vout, out := range msgTx.TxOut {
 				if out.Value == 0 {
 					continue
 				}
-				if out.Version != currentScriptVersion {
+				if out.Version != dexdcr.CurrentScriptVersion {
 					continue
 				}
-				scriptType := parseScriptType(currentScriptVersion, out.PkScript, nil)
+				scriptType := dexdcr.ParseScriptType(dexdcr.CurrentScriptVersion, out.PkScript, nil)
 				// We can't do P2SH during live testing, because we don't have the
 				// scripts. Just count them for now.
-				if scriptType.isP2SH() {
+				if scriptType.IsP2SH() {
 					switch {
-					case scriptType.isStake():
+					case scriptType.IsStake():
 						stats.sp2sh++
 					default:
 						stats.p2sh++
 					}
 					continue
-				} else if scriptType&scriptP2PKH != 0 {
+				} else if scriptType&dexdcr.ScriptP2PKH != 0 {
 					switch {
-					case scriptType&scriptSigEdwards != 0:
+					case scriptType&dexdcr.ScriptSigEdwards != 0:
 						stats.p2pkhEdwards++
-					case scriptType&scriptSigSchnorr != 0:
+					case scriptType&dexdcr.ScriptSigSchnorr != 0:
 						stats.p2pkhSchnorr++
-					case scriptType.isStake():
+					case scriptType.IsStake():
 						stats.sp2pkh++
 					default:
 						stats.p2pkh++
 					}
 				}
 				// Check if its an acceptable script type.
-				scriptTypeOK := scriptType != scriptUnsupported
-				// Now try to get the UXO with the dcrBackend
+				scriptTypeOK := scriptType != dexdcr.ScriptUnsupported
+				// Now try to get the UTXO with the Backend
 				utxo, err := dcr.utxo(txHash, uint32(vout), nil)
-				// Can't do stakebase or cainbase.
+				// Can't do stakebase or coinbase.
 				// ToDo: Use a custom error and check it.
 				if err == immatureTransactionError {
 					// just count these for now.
@@ -199,9 +206,13 @@ func TestLiveUTXO(t *testing.T) {
 				//    unless output is spent in mempool.
 				// 3. script is of unacceptable type, and is found. Error.
 				// 4. script is of unacceptable type, and is not found. Should receive an
-				//    assets.UnsupportedScriptError.
+				//    dex.UnsupportedScriptError.
 				switch true {
 				case scriptTypeOK && err == nil:
+					if !fee {
+						fee = true
+						stats.feeRates = append(stats.feeRates, utxo.FeeRate())
+					}
 					// Just check for no error on Confirmations.
 					confs, err := utxo.Confirmations()
 					if err != nil {
@@ -271,7 +282,7 @@ func TestLiveUTXO(t *testing.T) {
 		prevHash = bestHash
 		tipHeight = currentHeight
 		if err != nil {
-			t.Fatalf("error retreiving best block: %v", err)
+			t.Fatalf("error retrieving best block: %v", err)
 		}
 		refreshMempool()
 		if scanUtxos(0, mempool) {
@@ -300,6 +311,14 @@ func TestLiveUTXO(t *testing.T) {
 	t.Logf("%d immature transactions in the last %d blocks", stats.immatureBefore, maturity)
 	t.Logf("%d immature transactions before %d blocks ago", stats.immatureAfter, maturity)
 	t.Logf("total unspent value counted: %.2f DCR", float64(stats.utxoVal)/1e8)
+	feeCount := len(stats.feeRates)
+	if feeCount > 0 {
+		var feeSum uint64
+		for _, r := range stats.feeRates {
+			feeSum += r
+		}
+		t.Logf("%d fees, avg rate %d", feeCount, feeSum/uint64(feeCount))
+	}
 }
 
 // TestCacheAdvantage compares the speed of requesting blocks from the RPC vs.
@@ -308,7 +327,7 @@ func TestCacheAdvantage(t *testing.T) {
 	client := dcr.client
 	nextHash, _, err := client.GetBestBlock()
 	if err != nil {
-		t.Fatalf("error retreiving best block info")
+		t.Fatalf("error retrieving best block info")
 	}
 	numBlocks := 10000
 	blocks := make([]*chainjson.GetBlockVerboseResult, 0, numBlocks)
@@ -354,7 +373,7 @@ func TestCacheAdvantage(t *testing.T) {
 		}
 		_ = b
 	}
-	t.Logf("%d cached blocks retreived in %.3f ms", numBlocks, float64(time.Since(start).Nanoseconds())/1e6)
+	t.Logf("%d cached blocks retrieved in %.3f ms", numBlocks, float64(time.Since(start).Nanoseconds())/1e6)
 }
 
 // TestBlockMonitor is a live test that connects to dcrd and listens for block
@@ -368,100 +387,25 @@ func TestBlockMonitor(t *testing.T) {
 out:
 	for {
 		select {
-		case height := <-blockChan:
-			if height > lastHeight {
-				t.Logf("block received for height %d", height)
-			} else {
-				reorgDepth := lastHeight - height + 1
-				t.Logf("block received for block %d causes a %d block reorg", height, reorgDepth)
+		case update := <-blockChan:
+			if update.Err != nil {
+				t.Fatalf("error encountered while monitoring blocks: %v", update.Err)
 			}
 			tipHeight := dcr.blockCache.tipHeight()
-			if tipHeight != height {
-				t.Fatalf("unexpected height after block notification. expected %d, received %d", height, tipHeight)
+			if update.Reorg {
+				fmt.Printf("block received at height %d causes a %d block reorg\n", tipHeight, lastHeight-tipHeight+1)
+			} else {
+				fmt.Printf("block received for height %d\n", tipHeight)
 			}
-			_, err := dcr.getMainchainDcrBlock(height)
+			lastHeight = tipHeight
+			_, err := dcr.getMainchainDcrBlock(tipHeight)
 			if err != nil {
-				t.Fatalf("error getting newly connected block at height %d", height)
+				t.Fatalf("error getting newly connected block at height %d", tipHeight)
 			}
-		case <-dcr.ctx.Done():
+		case <-ctx.Done():
 			break out
 		case <-expire:
 			break out
 		}
 	}
-}
-
-// Just some random on-chain tx fee rate data.
-var feeStandards = map[string]uint64{
-	"76634e947f49dfc6228c3e8a09cd3e9e15893439fc06df7df0fc6f08d659856c": 1007,
-	"71c413922061c5822b1031f9cfc36cd9f358aaf1b9e5d9fcef428aadf55da604": 100,
-	"56998118e785cecb187fd6eb64512b07e5c8df2e3c9636a3e7094f0cea3c07cb": 101,
-}
-
-// TestLiveFees scans block by block backwards, grabbing the Tx from the
-// backend for each transaction and taking stats on the fees. The random
-// on-chain data from feeStandards is also checked.
-func TestLiveFees(t *testing.T) {
-	type testStats struct {
-		count int
-		sum   int
-		start time.Time
-	}
-	client := dcr.client
-	stats := testStats{start: time.Now()}
-	numToDo := 100
-	nextHash, _, err := client.GetBestBlock()
-	if err != nil {
-		t.Fatalf("error retreiving best block info")
-	}
-out:
-	for {
-		block, err := client.GetBlockVerbose(nextHash, false)
-		if err != nil {
-			t.Fatalf("error retreving block %s: %v", nextHash, err)
-		}
-		nextHash, err = chainhash.NewHashFromStr(block.PreviousHash)
-		if err != nil {
-			t.Fatalf("error decoding block id %s: %v", block.PreviousHash, err)
-		}
-		for _, txid := range block.Tx {
-			txHash, err := chainhash.NewHashFromStr(txid)
-			if err != nil {
-				t.Fatalf("error parsing transaction hash from %s: %v", txid, err)
-			}
-			tx, err := dcr.transaction(txHash)
-			if err != nil {
-				t.Fatalf("error retreiving transaction %s: %v", txid, err)
-			}
-			stats.count++
-			stats.sum += int(tx.FeeRate())
-			if stats.count >= numToDo {
-				break out
-			}
-			prevHash, err := chainhash.NewHashFromStr(block.PreviousHash)
-			if err != nil {
-				t.Fatalf("error retrieving block %s: %v", block.PreviousHash, err)
-			}
-			block, err = dcr.node.GetBlockVerbose(prevHash, false)
-			if err != nil {
-				t.Fatalf("error getting block verbose %s: %v", txHash, err)
-			}
-		}
-	}
-	for txid, expRate := range feeStandards {
-		txHash, err := chainhash.NewHashFromStr(txid)
-		if err != nil {
-			t.Fatalf("error parsing transaction hash from %s: %v", txid, err)
-		}
-		tx, err := dcr.transaction(txHash)
-		if err != nil {
-			t.Fatalf("error retreiving transaction %s", txid)
-		}
-		feeRate := tx.FeeRate()
-		if feeRate != expRate {
-			t.Fatalf("unexpected fee rate for %s. expected %d, got %d", txid, expRate, feeRate)
-		}
-	}
-	t.Logf("average per-tx fee rate: %d satoshi/byte", stats.sum/stats.count)
-	t.Logf("time per tx: %d ms", time.Since(stats.start).Milliseconds())
 }

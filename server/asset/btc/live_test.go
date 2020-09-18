@@ -39,34 +39,53 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/decred/dcrdex/server/asset"
-	"github.com/decred/slog"
+	"decred.org/dcrdex/dex"
 )
 
 var (
 	btc *Backend
+	ctx context.Context
 )
 
 func TestMain(m *testing.M) {
-	logger := slog.NewBackend(os.Stdout).Logger("BTCTEST")
-	ctx, shutdown := context.WithCancel(context.Background())
-	defer shutdown()
-	var err error
-	dexAsset, err := NewBackend(ctx, "", logger, asset.Mainnet)
-	if err != nil {
-		fmt.Printf("NewBackend error: %v\n", err)
-		return
+	// Wrap everything for defers.
+	doIt := func() int {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		defer func() {
+			cancel()
+			wg.Wait()
+		}()
+
+		logger := dex.StdOutLogger("BTCTEST", dex.LevelTrace)
+		dexAsset, err := NewBackend("", logger, dex.Mainnet)
+		if err != nil {
+			fmt.Printf("NewBackend error: %v\n", err)
+			return 1
+		}
+
+		var ok bool
+		btc, ok = dexAsset.(*Backend)
+		if !ok {
+			fmt.Printf("Could not cast asset.Backend to *Backend")
+			return 1
+		}
+
+		wg.Add(1)
+		go func() {
+			dexAsset.Run(ctx)
+			wg.Done()
+		}()
+
+		return m.Run()
 	}
-	var ok bool
-	btc, ok = dexAsset.(*Backend)
-	if !ok {
-		fmt.Printf("Could not cast DEXAsset to *Backend")
-		return
-	}
-	os.Exit(m.Run())
+
+	os.Exit(doIt())
 }
 
 // TestUTXOStats is routed through the exported testing utility LiveUTXOStats,
@@ -83,14 +102,6 @@ func TestP2SHStats(t *testing.T) {
 	LiveP2SHStats(btc, t)
 }
 
-func TestLiveFees(t *testing.T) {
-	LiveFeeRates(btc, t, map[string]uint64{
-		"a32697f1796b7b87d953637ac827e11b84c6b0f9237cff793f329f877af50aea": 5848,
-		"f3e3e209672fc057bd896c0f703f092a251fa4dca09d062a0223f760661b8187": 340,
-		"a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d": 4191,
-	})
-}
-
 // TestBlockMonitor is a live test that connects to bitcoind and listens for
 // block updates, checking the state of the cache along the way. See TestReorg
 // for additional testing of the block monitor loop.
@@ -103,22 +114,22 @@ func TestBlockMonitor(t *testing.T) {
 out:
 	for {
 		select {
-		case height := <-blockChan:
-			if height > lastHeight {
-				fmt.Printf("block received for height %d\n", height)
-			} else {
-				reorgDepth := lastHeight - height + 1
-				fmt.Printf("block received for block %d causes a %d block reorg\n", height, reorgDepth)
+		case update := <-blockChan:
+			if update.Err != nil {
+				t.Fatalf("error encountered while monitoring blocks: %v", update.Err)
 			}
 			tipHeight := btc.blockCache.tipHeight()
-			if tipHeight != height {
-				t.Fatalf("unexpected height after block notification. expected %d, received %d", height, tipHeight)
+			if update.Reorg {
+				fmt.Printf("block received at height %d causes a %d block reorg\n", tipHeight, lastHeight-tipHeight+1)
+			} else {
+				fmt.Printf("block received for height %d\n", tipHeight)
 			}
-			_, found := btc.blockCache.atHeight(height)
+			lastHeight = tipHeight
+			_, found := btc.blockCache.atHeight(tipHeight)
 			if !found {
-				t.Fatalf("did not find newly connected block at height %d", height)
+				t.Fatalf("did not find newly connected block at height %d", tipHeight)
 			}
-		case <-btc.ctx.Done():
+		case <-ctx.Done():
 			break out
 		case <-expire:
 			break out
@@ -126,8 +137,16 @@ out:
 	}
 }
 
+func TestLiveFees(t *testing.T) {
+	LiveFeeRates(btc, t, map[string]uint64{
+		"a32697f1796b7b87d953637ac827e11b84c6b0f9237cff793f329f877af50aea": 5848,
+		"f3e3e209672fc057bd896c0f703f092a251fa4dca09d062a0223f760661b8187": 506,
+		"a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d": 4191,
+	})
+}
+
 // This test does not pass yet.
-// type backendConstructor func(context.Context, string, asset.Logger, asset.Network) (asset.DEXAsset, error)
+// type backendConstructor func(context.Context, string, asset.Logger, asset.Network) (asset.Backend, error)
 //
 // // TestPlugin checks for a plugin file with the default name in the current
 // // directory.
@@ -135,7 +154,7 @@ out:
 // func TestPlugin(t *testing.T) {
 // 	dir, err := os.Getwd()
 // 	if err != nil {
-// 		t.Fatalf("error retreiving working directory: %v", err)
+// 		t.Fatalf("error retrieving working directory: %v", err)
 // 	}
 // 	pluginPath := filepath.Join(dir, "btc.so")
 // 	if _, err = os.Stat(pluginPath); os.IsNotExist(err) {
@@ -156,13 +175,13 @@ out:
 // 	logger := slog.NewBackend(os.Stdout).Logger("PLUGIN")
 // 	ctx, shutdown := context.WithCancel(context.Background())
 // 	defer shutdown()
-// 	dexAsset, err := constructor(ctx, SystemConfigPath("bitcoin"), logger, asset.Mainnet)
+// 	dexAsset, err := constructor(ctx, SystemConfigPath("bitcoin"), logger, dex.Mainnet)
 // 	if err != nil {
-// 		t.Fatalf("error creating DEXAsset from imported constructor: %v", err)
+// 		t.Fatalf("error creating Backend from imported constructor: %v", err)
 // 	}
 // 	btc, ok := dexAsset.(*Backend)
 // 	if !ok {
-// 		t.Fatalf("failed to cast plugin DEXAsset to *Backend")
+// 		t.Fatalf("failed to cast plugin Backend to *Backend")
 // 	}
 // 	_, err = btc.node.GetBestBlockHash()
 // 	if err != nil {

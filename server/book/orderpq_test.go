@@ -5,7 +5,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/decred/dcrdex/server/order"
+	"decred.org/dcrdex/dex/order"
 )
 
 type Order = order.LimitOrder
@@ -15,8 +15,9 @@ var (
 	orders  = []*Order{
 		newLimitOrder(false, 42000000, 2, order.StandingTiF, 0),
 		newLimitOrder(false, 10000, 2, order.StandingTiF, 0),
-		newLimitOrder(false, 42000000, 2, order.StandingTiF, -1000),
+		newLimitOrder(false, 42000000, 2, order.StandingTiF, -1000), // rate dup, different time
 		newLimitOrder(false, 123000000, 2, order.StandingTiF, 0),
+		newLimitOrder(false, 42000000, 1, order.StandingTiF, 0), // rate and time dup, different OrderID
 	}
 )
 
@@ -40,7 +41,7 @@ func newFakeAddr() string {
 	return string(b)
 }
 
-func genBigList() {
+func genBigList(listSize int) {
 	if bigList != nil {
 		return
 	}
@@ -50,13 +51,20 @@ func genBigList() {
 	seed := int64(-3405439173988651889)
 	rand.Seed(seed)
 
-	listSize := 1000000
+	dupRate := 400
+	if listSize < dupRate {
+		dupRate = listSize / 10
+	}
+	if dupRate == 0 {
+		dupRate = 2
+	}
+
 	bigList = make([]*Order, 0, listSize)
 	for i := 0; i < listSize; i++ {
 		order := newLimitOrder(false, uint64(rand.Int63n(90000000)), uint64(rand.Int63n(6))+1, order.StandingTiF, rand.Int63n(240)-120)
 		order.Address = newFakeAddr()
 		// duplicate some prices
-		if (i+1)%(listSize/400) == 0 {
+		if (i+1)%(listSize/dupRate) == 0 {
 			order.Rate = bigList[i/2].Rate
 			order.Quantity = bigList[i/2].Quantity + 1
 		}
@@ -68,7 +76,11 @@ func genBigList() {
 func TestLargeOrderMaxPriorityQueue(t *testing.T) {
 	startLogger()
 
-	genBigList()
+	if testing.Short() {
+		genBigList(10000)
+	} else {
+		genBigList(1000000)
+	}
 
 	// Max oriented queue
 	pq := NewMaxOrderPQ(uint32(len(bigList) * 3 / 2))
@@ -148,7 +160,11 @@ func TestLargeOrderMaxPriorityQueue(t *testing.T) {
 func TestLargeOrderMinPriorityQueue(t *testing.T) {
 	startLogger()
 
-	genBigList()
+	if testing.Short() {
+		genBigList(10000)
+	} else {
+		genBigList(1000000)
+	}
 
 	// Min oriented queue
 	pq := NewMinOrderPQ(uint32(len(bigList) * 3 / 2))
@@ -228,7 +244,11 @@ func TestLargeOrderMinPriorityQueue(t *testing.T) {
 func TestLargeOrderMaxPriorityQueue_Orders(t *testing.T) {
 	startLogger()
 
-	genBigList()
+	if testing.Short() {
+		genBigList(10000)
+	} else {
+		genBigList(1000000)
+	}
 
 	// Max oriented queue (sell book)
 	pq := NewMaxOrderPQ(uint32(len(bigList) * 3 / 2))
@@ -258,6 +278,16 @@ func TestLargeOrderMaxPriorityQueue_Orders(t *testing.T) {
 		// for _, op := range ordersSorted {
 		// 	t.Log(op.Price(), op.Time())
 		// }
+	}
+
+	ordersSorted2 := pq.OrdersN(pq.Count())
+	if len(ordersSorted2) != len(ordersSorted) {
+		t.Fatalf("Orders() and OrdersN(Count()) returned different slices.")
+	}
+	for i, o := range ordersSorted {
+		if o.ID() != ordersSorted2[i].ID() {
+			t.Errorf("Mismatched orders: %v != %v", o, ordersSorted2[i])
+		}
 	}
 
 	// Copy out just the six best orders.
@@ -290,7 +320,11 @@ func TestLargeOrderMaxPriorityQueue_Orders(t *testing.T) {
 func TestLargeOrderMaxPriorityQueue_Realloc(t *testing.T) {
 	startLogger()
 
-	genBigList()
+	if testing.Short() {
+		genBigList(10000)
+	} else {
+		genBigList(1000000)
+	}
 
 	// Max oriented queue (sell book)
 	pq := NewMaxOrderPQ(uint32(len(bigList)))
@@ -347,7 +381,7 @@ func TestLargeOrderMaxPriorityQueue_Realloc(t *testing.T) {
 func TestMinOrderPriorityQueue(t *testing.T) {
 	startLogger()
 
-	pq := NewMinOrderPQ(4)
+	pq := NewMinOrderPQ(5)
 
 	for _, o := range orders {
 		ok := pq.Insert(o)
@@ -366,7 +400,7 @@ func TestMinOrderPriorityQueue(t *testing.T) {
 func TestMaxOrderPriorityQueue(t *testing.T) {
 	startLogger()
 
-	pq := NewMaxOrderPQ(4)
+	pq := NewMaxOrderPQ(5)
 
 	for _, o := range orders {
 		ok := pq.Insert(o)
@@ -395,8 +429,31 @@ func TestMaxOrderPriorityQueue_TieRate(t *testing.T) {
 	}
 
 	best := pq.ExtractBest()
-	//t.Log(best.String()) // the older order
 	if best.UID() != orders[2].UID() {
+		t.Errorf("Incorrect highest rate order returned: rate = %d, UID = %s",
+			best.Price(), best.UID())
+	}
+}
+
+func TestMaxOrderPriorityQueue_TieRateAndTime(t *testing.T) {
+	startLogger()
+
+	pq := NewMaxOrderPQ(4)
+
+	// 7f9200eedcf2fa868173cdfc2101ee4d71ec024c1c052589b3371442aaa26c2d
+	ok := pq.Insert(orders[0])
+	if !ok {
+		t.Errorf("Failed to insert order %v", orders[0])
+	}
+
+	// 2eb563f255b0a9484bbbee718b2cdce3a31bd5ea8649b579b3184a4bd60d1703 ** higher priority
+	ok = pq.Insert(orders[4])
+	if !ok {
+		t.Errorf("Failed to insert order %v", orders[4])
+	}
+
+	best := pq.ExtractBest()
+	if best.UID() != orders[4].UID() {
 		t.Errorf("Incorrect highest rate order returned: rate = %d, UID = %s",
 			best.Price(), best.UID())
 	}
@@ -529,12 +586,12 @@ func TestOrderPriorityQueue_Remove(t *testing.T) {
 	if pq.Len() != 1 {
 		t.Errorf("Queue length expected %d, got %d", 1, pq.Len())
 	}
-	remainingUID := pq.PeekBest().UID()
-	if remainingUID != orders[0].UID() {
-		t.Errorf("Remaining element expected %s, got %s", orders[0].UID(),
-			remainingUID)
+	remainingID := pq.PeekBest().ID()
+	if remainingID != orders[0].ID() {
+		t.Errorf("Remaining element expected %s, got %s", orders[0].ID(),
+			remainingID)
 	}
-	pq.RemoveOrderUID(remainingUID)
+	pq.RemoveOrderID(remainingID)
 	if pq.Len() != 0 {
 		t.Errorf("Expected empty queue, got %d", pq.Len())
 	}
@@ -543,7 +600,11 @@ func TestOrderPriorityQueue_Remove(t *testing.T) {
 func TestOrderPQMin_Worst(t *testing.T) {
 	startLogger()
 
-	genBigList()
+	if testing.Short() {
+		genBigList(10000)
+	} else {
+		genBigList(1000000)
+	}
 
 	pq0 := NewMinOrderPQ(4)
 	worst := pq0.Worst()
@@ -590,7 +651,11 @@ func TestOrderPQMin_Worst(t *testing.T) {
 func TestOrderPQMax_Worst(t *testing.T) {
 	startLogger()
 
-	genBigList()
+	if testing.Short() {
+		genBigList(10000)
+	} else {
+		genBigList(1000000)
+	}
 
 	// Max oriented queue
 	pq := NewMaxOrderPQ(uint32(len(bigList) * 3 / 2))
@@ -612,7 +677,7 @@ func TestOrderPQMax_Worst(t *testing.T) {
 		return bigList[i].Price() < bigList[j].Price()
 	})
 
-	t.Log(bigList[0].Price(), bigList[len(bigList)-1].Price(), pq.PeekBest().Price())
+	//t.Log(bigList[0].Price(), bigList[len(bigList)-1].Price(), pq.PeekBest().Price())
 
 	// Worst for a min queue is highest rate.
 	worst := pq.Worst()
@@ -624,7 +689,11 @@ func TestOrderPQMax_Worst(t *testing.T) {
 func TestOrderPQMax_leafNodes(t *testing.T) {
 	startLogger()
 
-	genBigList()
+	if testing.Short() {
+		genBigList(10000)
+	} else {
+		genBigList(1000000)
+	}
 
 	// Max oriented queue
 	newQ := func(list []*Order) *OrderPQ {

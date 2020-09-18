@@ -5,7 +5,9 @@
 package book
 
 import (
-	"github.com/decred/dcrdex/server/order"
+	"sync"
+
+	"decred.org/dcrdex/dex/order"
 )
 
 const (
@@ -21,7 +23,9 @@ const (
 // allow constant time access to the best orders, and log time insertion and
 // removal of orders.
 type Book struct {
+	mtx     sync.RWMutex
 	lotSize uint64
+	halfCap uint32
 	buys    *OrderPQ
 	sells   *OrderPQ
 }
@@ -36,16 +40,27 @@ func New(lotSize uint64, halfCapacity ...uint32) *Book {
 	}
 	return &Book{
 		lotSize: lotSize,
+		halfCap: halfCap,
 		buys:    NewMaxOrderPQ(halfCap),
 		sells:   NewMinOrderPQ(halfCap),
 	}
 }
 
+// Clear reset the order book with configured capacity.
+func (b *Book) Clear() {
+	b.mtx.Lock()
+	b.buys = NewMaxOrderPQ(b.halfCap)
+	b.sells = NewMaxOrderPQ(b.halfCap)
+	b.mtx.Unlock()
+}
+
 // Realloc changes the capacity of the order book given the specified capacity
 // of both buy and sell sides of the book.
 func (b *Book) Realloc(newHalfCap uint32) {
+	b.mtx.Lock()
 	b.buys.Realloc(newHalfCap)
 	b.sells.Realloc(newHalfCap)
+	b.mtx.Unlock()
 }
 
 // LotSize returns the Book's configured lot size in atoms of the base asset.
@@ -75,6 +90,16 @@ func (b *Book) BestBuy() *order.LimitOrder {
 	return b.buys.PeekBest()
 }
 
+// Best returns pointers to the best buy and sell order in the order book. The
+// orders are NOT removed from the book.
+func (b *Book) Best() (bestBuy, bestSell *order.LimitOrder) {
+	b.mtx.RLock()
+	bestBuy = b.buys.PeekBest()
+	bestSell = b.sells.PeekBest()
+	b.mtx.RUnlock()
+	return
+}
+
 // Insert attempts to insert the provided order into the order book, returning a
 // boolean indicating if the insertion was successful. If the order is not an
 // integer multiple of the Book's lot size, the order will not be inserted.
@@ -84,6 +109,8 @@ func (b *Book) Insert(o *order.LimitOrder) bool {
 			"quantity that is not a multiple of lot size.")
 		return false
 	}
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
 	if o.Sell {
 		return b.sells.Insert(o)
 	}
@@ -92,42 +119,51 @@ func (b *Book) Insert(o *order.LimitOrder) bool {
 
 // Remove attempts to remove the order with the given OrderID from the book.
 func (b *Book) Remove(oid order.OrderID) (*order.LimitOrder, bool) {
-	uid := oid.String()
-	if removed, ok := b.sells.RemoveOrderUID(uid); ok {
+	b.mtx.Lock()
+	defer b.mtx.Unlock()
+	if removed, ok := b.sells.RemoveOrderID(oid); ok {
 		return removed, true
 	}
-	if removed, ok := b.buys.RemoveOrderUID(uid); ok {
+	if removed, ok := b.buys.RemoveOrderID(oid); ok {
 		return removed, true
 	}
 	return nil, false
 }
 
+// HaveOrder checks if an order is in either the buy or sell side of the book.
+func (b *Book) HaveOrder(oid order.OrderID) bool {
+	b.mtx.RLock()
+	defer b.mtx.RUnlock()
+	return b.buys.HaveOrder(oid) || b.sells.HaveOrder(oid)
+}
+
+// Order attempts to retrieve an order from either the buy or sell side of the
+// book. If the order data is not required, consider using HaveOrder.
+func (b *Book) Order(oid order.OrderID) *order.LimitOrder {
+	b.mtx.RLock()
+	defer b.mtx.RUnlock()
+	if lo := b.buys.Order(oid); lo != nil {
+		return lo
+	}
+	return b.sells.Order(oid)
+}
+
 // SellOrders copies out all sell orders in the book, sorted.
 func (b *Book) SellOrders() []*order.LimitOrder {
-	return b.SellOrdersN(b.SellCount())
+	return b.sells.Orders()
 }
 
 // SellOrdersN copies out the N best sell orders in the book, sorted.
 func (b *Book) SellOrdersN(N int) []*order.LimitOrder {
-	orders := b.sells.OrdersN(N) // N = len(orders)
-	limits := make([]*order.LimitOrder, 0, len(orders))
-	for _, o := range orders {
-		limits = append(limits, o)
-	}
-	return limits
+	return b.sells.OrdersN(N)
 }
 
 // BuyOrders copies out all buy orders in the book, sorted.
 func (b *Book) BuyOrders() []*order.LimitOrder {
-	return b.BuyOrdersN(b.BuyCount())
+	return b.buys.Orders()
 }
 
 // BuyOrdersN copies out the N best buy orders in the book, sorted.
 func (b *Book) BuyOrdersN(N int) []*order.LimitOrder {
-	orders := b.buys.OrdersN(N) // N = len(orders)
-	limits := make([]*order.LimitOrder, 0, len(orders))
-	for _, o := range orders {
-		limits = append(limits, o)
-	}
-	return limits
+	return b.buys.OrdersN(N)
 }

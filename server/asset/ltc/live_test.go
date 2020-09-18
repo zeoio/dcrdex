@@ -22,34 +22,53 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 
-	"github.com/decred/dcrdex/server/asset"
-	"github.com/decred/dcrdex/server/asset/btc"
-	"github.com/decred/slog"
+	"decred.org/dcrdex/dex"
+	"decred.org/dcrdex/server/asset/btc"
 )
 
 var (
 	ltc *btc.Backend
+	ctx context.Context
 )
 
 func TestMain(m *testing.M) {
-	logger := slog.NewBackend(os.Stdout).Logger("TEST")
-	ctx, shutdown := context.WithCancel(context.Background())
-	defer shutdown()
-	var err error
-	dexAsset, err := NewBackend(ctx, "", logger, asset.Mainnet)
-	if err != nil {
-		fmt.Printf("NewBackend error: %v\n", err)
-		return
+	// Wrap everything for defers.
+	doIt := func() int {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		defer func() {
+			cancel()
+			wg.Wait()
+		}()
+
+		logger := dex.StdOutLogger("LTCTEST", dex.LevelTrace)
+		dexAsset, err := NewBackend("", logger, dex.Mainnet)
+		if err != nil {
+			fmt.Printf("NewBackend error: %v\n", err)
+			return 1
+		}
+
+		var ok bool
+		ltc, ok = dexAsset.(*btc.Backend)
+		if !ok {
+			fmt.Printf("Could not cast asset.Backend to *Backend")
+			return 1
+		}
+
+		wg.Add(1)
+		go func() {
+			dexAsset.Run(ctx)
+			wg.Done()
+		}()
+
+		return m.Run()
 	}
-	var ok bool
-	ltc, ok = dexAsset.(*btc.Backend)
-	if !ok {
-		fmt.Printf("Could not cast DEXAsset to *Backend")
-		return
-	}
-	os.Exit(m.Run())
+
+	os.Exit(doIt())
 }
 
 func TestUTXOStats(t *testing.T) {
@@ -65,5 +84,6 @@ func TestLiveFees(t *testing.T) {
 		"d9ec52f3d2c8497638b7de47f77b1e00e91ca98f88bf844b1ae3a2a8ca44bf0b": 1000,
 		"da68b225de1650d69fb57216d8403f91ea0a4b04f7be89150061748863480980": 703,
 		"6e7bfce6aee69312629b1f60afe6dcef02f367207642f2dc380a554c21181eb2": 888,
+		"9387d8b2097ee23cc3da36daf90262dda9a98eb25063ddddb630cf15513fa9b8": 1,
 	})
 }

@@ -4,12 +4,13 @@
 package book
 
 import (
+	"bytes"
 	"container/heap"
 	"fmt"
 	"sort"
 	"sync"
 
-	"github.com/decred/dcrdex/server/order"
+	"decred.org/dcrdex/dex/order"
 )
 
 type orderEntry struct {
@@ -27,7 +28,7 @@ type OrderPQ struct {
 	oh       orderHeap
 	capacity uint32
 	lessFn   func(bi, bj *order.LimitOrder) bool
-	orders   map[string]*orderEntry
+	orders   map[order.OrderID]*orderEntry
 }
 
 // Copy makes a deep copy of the OrderPQ. The orders are the same; each
@@ -62,9 +63,9 @@ func (pq *OrderPQ) copy(newCap uint32) *OrderPQ {
 	}
 
 	// Deep copy the orders map.
-	orders := make(map[string]*orderEntry, newCap)
+	orders := make(map[order.OrderID]*orderEntry, newCap)
 	for _, oe := range orderHeap {
-		orders[oe.order.UID()] = oe
+		orders[oe.order.ID()] = oe
 	}
 
 	newPQ := &OrderPQ{
@@ -81,35 +82,22 @@ func (pq *OrderPQ) copy(newCap uint32) *OrderPQ {
 	return newPQ
 }
 
-// Orders copies all orders, sorted with the lessFn. To avoid modifying the
-// OrderPQ or any of the data fields, a deep copy of the OrderPQ is made and
-// ExtractBest is called until all entries are extracted.
+// Orders copies all orders, sorted with the lessFn. The OrderPQ is unmodified.
 func (pq *OrderPQ) Orders() []*order.LimitOrder {
+	// Deep copy the orders.
 	pq.mtx.RLock()
-
-	// To use the configured lessFn, make a temporary OrderPQ with just the
-	// lessFn and orderHeap set. Do not use the constructor since we do not care
-	// about the orders map or capacity.
-	pqTmp := OrderPQ{
-		lessFn: pq.lessFn,
-		oh:     make(orderHeap, len(pq.oh)),
+	orders := make([]*order.LimitOrder, len(pq.oh))
+	for i, oe := range pq.oh {
+		orders[i] = oe.order
 	}
-	copy(pqTmp.oh, pq.oh)
 	pq.mtx.RUnlock()
 
-	// Sort the orderHeap, which implements sort.Interface with the configured
-	// lessFn.
-	sort.Sort(&pqTmp)
+	// Sort the orders with pq.lessFn.
+	sort.Slice(orders, func(i, j int) bool {
+		return pq.lessFn(orders[i], orders[j])
+	})
 
-	// Extract the LimitOrder from each orderEntry in heap.
-	orders := make([]*order.LimitOrder, len(pqTmp.oh))
-	for i := range pqTmp.oh {
-		orders[i] = pqTmp.oh[i].order
-	}
 	return orders
-
-	// Copy heap and extract N.
-	//return pq.OrdersN(len(pq.oh))
 }
 
 // OrdersN copies the N best orders, sorted with the lessFn. To avoid modifying
@@ -162,7 +150,7 @@ func newOrderPQ(cap uint32, lessFn func(bi, bj *order.LimitOrder) bool) *OrderPQ
 		oh:       make(orderHeap, 0, cap),
 		capacity: cap,
 		lessFn:   lessFn,
-		orders:   make(map[string]*orderEntry, cap),
+		orders:   make(map[order.OrderID]*orderEntry, cap),
 	}
 }
 
@@ -211,13 +199,13 @@ func (pq *OrderPQ) Push(ord interface{}) {
 		heapIdx: len(pq.oh),
 	}
 
-	uid := entry.order.UID()
-	if pq.orders[uid] != nil {
+	oid := entry.order.ID()
+	if pq.orders[oid] != nil {
 		fmt.Printf("Attempted to push existing order: %v", ord)
 		return
 	}
 
-	pq.orders[uid] = entry
+	pq.orders[oid] = entry
 
 	pq.oh = append(pq.oh, entry)
 }
@@ -231,7 +219,7 @@ func (pq *OrderPQ) Pop() interface{} {
 	ord := old[n-1] // heap.Pop put the best value at the end and reheaped without it
 	ord.heapIdx = -1
 	pq.oh = old[0 : n-1]
-	delete(pq.orders, ord.order.UID())
+	delete(pq.orders, ord.order.ID())
 	return ord.order
 }
 
@@ -257,19 +245,35 @@ func GreaterByPrice(bi, bj *order.LimitOrder) bool {
 }
 
 // LessByPriceThenTime defines a higher priority as having a lower price rate,
-// with older orders breaking any tie.
+// with older orders breaking any tie, then OrderID as a last tie breaker.
 func LessByPriceThenTime(bi, bj *order.LimitOrder) bool {
 	if bi.Price() == bj.Price() {
-		return bi.Time() < bj.Time()
+		ti, tj := bi.Time(), bj.Time()
+		if ti == tj {
+			// Lexicographical comparison of the OrderIDs requires a slice. This
+			// comparison should be exceedingly rare, so the required memory
+			// allocations are acceptable.
+			idi, idj := bi.ID(), bj.ID()
+			return bytes.Compare(idi[:], idj[:]) < 0 // idi < idj
+		}
+		return ti < tj
 	}
 	return LessByPrice(bi, bj)
 }
 
 // GreaterByPriceThenTime defines a higher priority as having a higher price
-// rate, with older orders breaking any tie.
+// rate, with older orders breaking any tie, then OrderID as a last tie breaker.
 func GreaterByPriceThenTime(bi, bj *order.LimitOrder) bool {
 	if bi.Price() == bj.Price() {
-		return bi.Time() < bj.Time()
+		ti, tj := bi.Time(), bj.Time()
+		if ti == tj {
+			// Lexicographical comparison of the OrderIDs requires a slice. This
+			// comparison should be exceedingly rare, so the required memory
+			// allocations are acceptable.
+			idi, idj := bi.ID(), bj.ID()
+			return bytes.Compare(idi[:], idj[:]) < 0 // idi < idj
+		}
+		return ti < tj
 	}
 	return GreaterByPrice(bi, bj)
 }
@@ -307,14 +311,14 @@ func (pq *OrderPQ) Reset(orders []*order.LimitOrder) {
 	defer pq.mtx.Unlock()
 
 	pq.oh = make([]*orderEntry, 0, len(orders))
-	pq.orders = make(map[string]*orderEntry, len(pq.oh))
+	pq.orders = make(map[order.OrderID]*orderEntry, len(pq.oh))
 	for i, o := range orders {
 		entry := &orderEntry{
 			order:   o,
 			heapIdx: i,
 		}
 		pq.oh = append(pq.oh, entry)
-		pq.orders[o.UID()] = entry
+		pq.orders[o.ID()] = entry
 	}
 
 	heap.Init(pq)
@@ -335,9 +339,9 @@ func (pq *OrderPQ) resetHeap(oh []*orderEntry) {
 	pq.oh = make([]*orderEntry, len(oh))
 	copy(pq.oh, oh)
 
-	pq.orders = make(map[string]*orderEntry, len(oh))
+	pq.orders = make(map[order.OrderID]*orderEntry, len(oh))
 	for _, oe := range oh {
-		pq.orders[oe.order.UID()] = oe
+		pq.orders[oe.order.ID()] = oe
 	}
 
 	// Do not call Reheap unless you want a deadlock.
@@ -363,13 +367,13 @@ func (pq *OrderPQ) Insert(ord *order.LimitOrder) bool {
 		return false
 	}
 
-	if ord == nil || ord.UID() == "" {
+	if ord == nil {
 		return false
 	}
 
-	uid := ord.UID()
-	if oe, ok := pq.orders[uid]; ok {
-		fmt.Println(oe.order, uid)
+	oid := ord.ID()
+	if oe, ok := pq.orders[oid]; ok {
+		fmt.Println(oe.order, oid)
 		return false
 	}
 
@@ -394,40 +398,57 @@ func (pq *OrderPQ) ReplaceOrder(old *order.LimitOrder, new *order.LimitOrder) bo
 		return false
 	}
 
-	oldUID := old.UID()
-	entry := pq.orders[oldUID]
+	oldID := old.ID()
+	entry := pq.orders[oldID]
 	if entry == nil {
 		return false
 	}
 
-	newUID := new.UID()
-	// if oldUID == newUID {
+	newID := new.ID()
+	// if oldID == newID {
 	// 	return false
 	// }
-	// Above is commented to update regardless of UID.
+	// Above is commented to update regardless of ID.
 
-	delete(pq.orders, oldUID)
+	delete(pq.orders, oldID)
 	entry.order = new
-	pq.orders[newUID] = entry
+	pq.orders[newID] = entry
 
 	heap.Fix(pq, entry.heapIdx)
 	return true
 }
 
 // RemoveOrder attempts to remove the provided order from the priority queue
-// based on it's UID.
-func (pq *OrderPQ) RemoveOrder(r *order.LimitOrder) (*order.LimitOrder, bool) {
+// based on it's ID.
+func (pq *OrderPQ) RemoveOrder(lo *order.LimitOrder) (*order.LimitOrder, bool) {
 	pq.mtx.Lock()
 	defer pq.mtx.Unlock()
-	return pq.removeOrder(pq.orders[r.UID()])
+	return pq.removeOrder(pq.orders[lo.ID()])
 }
 
-// RemoveOrderUID attempts to remove the order with the given UID from the
+// RemoveOrderID attempts to remove the order with the given ID from the
 // priority queue.
-func (pq *OrderPQ) RemoveOrderUID(uid string) (*order.LimitOrder, bool) {
+func (pq *OrderPQ) RemoveOrderID(oid order.OrderID) (*order.LimitOrder, bool) {
 	pq.mtx.Lock()
 	defer pq.mtx.Unlock()
-	return pq.removeOrder(pq.orders[uid])
+	return pq.removeOrder(pq.orders[oid])
+}
+
+// HaveOrder indicates if an order is in the queue.
+func (pq *OrderPQ) HaveOrder(oid order.OrderID) bool {
+	pq.mtx.Lock()
+	defer pq.mtx.Unlock()
+	return pq.orders[oid] != nil
+}
+
+// Order retrieves any existing order in the queue with the given ID.
+func (pq *OrderPQ) Order(oid order.OrderID) *order.LimitOrder {
+	pq.mtx.Lock()
+	defer pq.mtx.Unlock()
+	if oe := pq.orders[oid]; oe != nil {
+		return oe.order
+	}
+	return nil
 }
 
 // removeOrder removes the specified orderEntry from the queue. This function is
@@ -435,15 +456,14 @@ func (pq *OrderPQ) RemoveOrderUID(uid string) (*order.LimitOrder, bool) {
 func (pq *OrderPQ) removeOrder(o *orderEntry) (*order.LimitOrder, bool) {
 	if o != nil && o.heapIdx >= 0 && o.heapIdx < pq.Len() {
 		// Only remove the order if it is really in the queue.
-		uid := o.order.UID()
+		oid := o.order.ID()
 		removed := pq.oh[o.heapIdx].order
-		if removed.UID() == uid {
-			delete(pq.orders, uid)
+		if removed.ID() == oid {
+			delete(pq.orders, oid)
 			pq.removeIndex(o.heapIdx)
 			return removed, true
 		}
-		log.Warnf("Tried to remove an order that was NOT in the PQ. ID: %s",
-			o.order.UID())
+		log.Warnf("Tried to remove an order that was NOT in the PQ. ID: %s", oid)
 	}
 	return nil, false
 }

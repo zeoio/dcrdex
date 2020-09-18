@@ -3,117 +3,127 @@
 
 package asset
 
-import "github.com/decred/slog"
+import (
+	"fmt"
+	"time"
 
-type Error string
-
-func (err Error) Error() string { return string(err) }
-
-const (
-	UnsupportedScriptError = Error("unsupported script type")
+	"decred.org/dcrdex/dex"
 )
 
-// Network flags passed to asset backends to signify which network to use.
-type Network uint8
+// CoinNotFoundError is to be returned from Contract, Redemption, and
+// FundingCoin when the specified transaction cannot be found. Used by the
+// server to handle network latency.
+const CoinNotFoundError = dex.ErrorKind("coin not found")
 
-const (
-	Mainnet Network = iota
-	Testnet
-	Regtest
-)
-
-// The DEX recognizes only three networks. Simnet is a alias of Regtest.
-const Simnet = Regtest
-
-// Every backend constructor will accept a Logger. All logging should take place
-// through the provided logger.
-type Logger = slog.Logger
-
-// The DEXAsset interface is an interface for a blockchain backend. The DEX
-// primarily needs to track UTXOs and transactions to validate orders, and
-// to monitor community conduct.
-type DEXAsset interface {
-	// UTXO should return a UTXO only for outputs that would be spendable on the
-	// blockchain immediately. Pay-to-script-hash UTXOs require the redeem script
-	// in order to calculate sigScript length and verify pubkeys.
-	UTXO(txid string, vout uint32, redeemScript []byte) (UTXO, error)
+// The Backend interface is an interface for a blockchain backend.
+type Backend interface {
+	dex.Runner
+	// Contract returns a Contract only for outputs that would be spendable on
+	// the blockchain immediately. The redeem script is required in order to
+	// calculate sigScript length and verify pubkeys.
+	Contract(coinID []byte, redeemScript []byte) (Contract, error)
+	// ValidateSecret checks that the secret satisfies the contract.
+	ValidateSecret(secret, contract []byte) bool
+	// Redemption returns a Coin for redemptionID, a transaction input, that
+	// spends contract ID, an output containing the swap contract.
+	Redemption(redemptionID, contractID []byte) (Coin, error)
+	// FundingCoin returns the unspent coin at the specified location. Coins
+	// with non-standard pkScripts or scripts that require zero signatures to
+	// redeem must return an error.
+	FundingCoin(coinID []byte, redeemScript []byte) (FundingCoin, error)
 	// BlockChannel creates and returns a new channel on which to receive updates
 	// when new blocks are connected.
-	BlockChannel(size int) chan uint32
-	// Transaction returns a DEXTx, which has methods for checking UTXO spending
-	// and swap contract info.
-	Transaction(txid string) (DEXTx, error)
+	BlockChannel(size int) <-chan *BlockUpdate
 	// InitTxSize is the size of a serialized atomic swap initialization
 	// transaction with 1 input spending a P2PKH utxo, 1 swap contract output and
 	// 1 change output.
 	InitTxSize() uint32
+	// InitTxSizeBase is InitTxSize not including an input.
+	InitTxSizeBase() uint32
 	// CheckAddress checks that the given address is parseable.
 	CheckAddress(string) bool
+	// ValidateCoinID checks the coinID to ensure it can be decoded, returning a
+	// human-readable string if it is valid.
+	ValidateCoinID(coinID []byte) (string, error)
+	// ValidateContract ensures that the swap contract is constructed properly
+	// for the asset.
+	ValidateContract(contract []byte) error
+	// VerifyUnspentCoin attempts to verify a coin ID by decoding the coin ID
+	// and retrieving the corresponding Coin. If the coin is not found or no
+	// longer unspent, an asset.CoinNotFoundError is returned. Use FundingCoin
+	// for more UTXO data.
+	VerifyUnspentCoin(coinID []byte) error
+	// FeeRate returns the current optimal fee rate in atoms / byte.
+	FeeRate() (uint64, error)
 }
 
-// UTXO provides data about an unspent transaction output.
-type UTXO interface {
-	// Confirmations returns the number of confirmations for a UTXO's transaction.
-	// Because a UTXO can become invalid after once being considered valid, this
-	// condition should be checked for during confirmation counting and an error
-	// returned if this UTXO is no longer ready to spend. An unmined transaction
-	// should have zero confirmations. A transaction in the current best block
-	// should have one confirmation. A negative number can be returned if error
-	// is not nil.
+// Coin represents a transaction input or output.
+type Coin interface {
+	// Confirmations returns the number of confirmations for a Coin's
+	// transaction. Because a Coin can become invalid after once being
+	// considered valid, this condition should be checked for during
+	// confirmation counting and an error returned if this Coin is no longer
+	// ready to spend. An unmined transaction should have zero confirmations. A
+	// transaction in the current best block should have one confirmation. A
+	// negative number can be returned if error is not nil.
+	//
+	// TODO: This really must get a timeout, and a short one, as the Swapper
+	// will block at inconvenient times. The timeout can be at the RPC client
+	// level or a wrapper around the underlying RPC calls
 	Confirmations() (int64, error)
-	// Auth checks that the owner of the provided pubkeys can spend the UTXO.
-	// The signatures (sigs) generated with the private keys corresponding
-	// to pubkeys must validate against the pubkeys and signing message (msg).
-	Auth(pubkeys, sigs [][]byte, msg []byte) error
-	// SpendSize returns the size of the serialized input that spends this UTXO.
-	SpendSize() uint32
-	// TxHash is a byte-slice of the UTXO's transaction hash.
-	TxHash() []byte
-	// TxID is a string identifier for the transaction, typically a hexadecimal
-	// representation of the byte-reversed transaction hash. Should always return
-	// the same value as the txid argument passed to (DEXAsset).UTXO.
+	// ID is the coin ID.
+	ID() []byte
+	// TxID is a transaction identifier for the coin.
 	TxID() string
-	// Vout is the output index of the UTXO.
-	Vout() uint32
-	// Value is the output value.
+	// String is a human readable representation of the Coin.
+	String() string
+	// Value is the coin value.
 	Value() uint64
-}
-
-// DEXTx provides methods for verifying transaction data.
-type DEXTx interface {
-	// Confirmations returns the number of confirmations for a transaction.
-	// Because a transaction can become invalid after once being considered valid,
-	// this condition should be checked for during confirmation counting and an
-	// error returned if this transactcion is no longer valid. An unmined
-	// transaction should have zero confirmations. A transaction in the current
-	// best block should have one transaction. A negative number can be returned
-	// if error is not nil.
-	Confirmations() (int64, error)
-	// SpendsUTXO checks if the transaction spends a specified previous output.
-	// An error will be returned if the input is not parseable. If the UTXO is not
-	// spent in this transaction, the boolean return value will be false, but no
-	// error is returned.
-	SpendsUTXO(txid string, vout uint32) (bool, error)
-	// AuditContract checks that the provided swap contract hashes to the script
-	// hash specified in the output at the indicated vout. The receiving address
-	// and output value (in atoms) are returned if no error is encountered.
-	AuditContract(vout uint32, contract []byte) (string, uint64, error)
 	// FeeRate returns the transaction fee rate, in atoms/byte equivalent.
 	FeeRate() uint64
 }
 
-// Type Asset combines the DEXAsset backend with the configurable asset
-// variables. The asset variables do not affect the backend operation, but are
-// grouped with the backend for convenience.
-type Asset struct {
-	Backend  DEXAsset
-	ID       uint32
-	Symbol   string
-	LotSize  uint64
-	RateStep uint64
-	FeeRate  uint64
-	SwapSize uint64
-	SwapConf uint32
-	FundConf uint32
-	Scripts  []string // Not sure that we need this or not.
+// FundingCoin is some unspent value on the blockchain.
+type FundingCoin interface {
+	Coin
+	// Auth checks that the owner of the provided pubkeys can spend the
+	// FundingCoin. The signatures (sigs) generated with the private keys
+	// corresponding to pubkeys must validate against the pubkeys and signing
+	// message (msg).
+	Auth(pubkeys, sigs [][]byte, msg []byte) error
+	// SpendSize returns the size of the serialized input that spends this
+	// FundingCoin.
+	SpendSize() uint32
+}
+
+// Contract is an atomic swap contract.
+type Contract interface {
+	Coin
+	// SwapAddress is the receiving address of the swap contract.
+	SwapAddress() string
+	// RedeemScript is the contract redeem script.
+	RedeemScript() []byte
+	// LockTime is the refund locktime.
+	LockTime() time.Time
+}
+
+// BlockUpdate is sent over the update channel when a tip change is detected.
+type BlockUpdate struct {
+	Err   error
+	Reorg bool
+}
+
+// ConnectionError error should be sent over the block update channel if a
+// connection error is detected by the Backend.
+type ConnectionError error
+
+// NewConnectionError is a constructor for a ConnectionError.
+func NewConnectionError(s string, a ...interface{}) ConnectionError {
+	return ConnectionError(fmt.Errorf(s, a...))
+}
+
+// BackedAsset is a dex.Asset with a Backend.
+type BackedAsset struct {
+	dex.Asset
+	Backend Backend
 }

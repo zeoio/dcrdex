@@ -5,135 +5,269 @@ package btc
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
+	"time"
 
+	"decred.org/dcrdex/dex"
+	dexbtc "decred.org/dcrdex/dex/networks/btc"
+	"decred.org/dcrdex/server/asset"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcutil"
 )
 
-// A UTXO is information regarding an unspent transaction output. It must
-// satisfy the asset.UTXO interface to be DEX-compatible.
-type UTXO struct {
-	// Because a UTXO's validity and block info can change after creation, keep a
+const ErrReorgDetected = dex.ErrorKind("reorg detected")
+
+// TXIO is common information stored with an Input or Output.
+type TXIO struct {
+	// Because a TXIO's validity and block info can change after creation, keep a
 	// Backend around to query the state of the tx and update the block info.
 	btc *Backend
+	tx  *Tx
 	// The height and hash of the transaction's best known block.
 	height    uint32
 	blockHash chainhash.Hash
-	txHash    chainhash.Hash
-	vout      uint32
-	// The number of confirmations needed for maturity. For outputs of a coinbase
-	// transaction, this will be set to chaincfg.Params.CoinbaseMaturity (100 for
-	// BTC). For other supported script types, this will be zero.
+	// The number of confirmations needed for maturity. For outputs of coinbase
+	// transactions, this will be set to chaincfg.Params.CoinbaseMaturity (256 for
+	// mainchain). For other supported script types, this will be zero.
 	maturity int32
-	// A bitmask for script type information.
-	scriptType btcScriptType
-	// The output's scriptPubkey.
-	pkScript []byte
-	// If the pubkey script is P2SH or P2WSH, the UTXO will only be generated if
-	// the redeem script is supplied and the script-hash validated. For P2PKH and
-	// P2WPKH pubkey scripts, the redeem script should be nil.
-	redeemScript []byte
-	// numSigs is the number of signatures required to spend this output.
-	numSigs int
-	// spendSize stores the best estimate of the size (bytes) of the serialized
-	// transaction input that spends this UTXO.
-	spendSize uint32
-	// The output value.
-	value uint64
-	// While the utxo's tx is still in mempool, the tip hash will be stored.
+	// While the TXIO's tx is still in mempool, the tip hash will be stored.
 	// This enables an optimization in the Confirmations method to return zero
-	// without extraneous block lookups.
+	// without extraneous RPC calls.
 	lastLookup *chainhash.Hash
 }
 
-// Confirmations returns the number of confirmations for a UTXO's transaction.
-// Because a UTXO can become invalid after once being considered valid, validity
+// confirmations returns the number of confirmations for a TXIO's transaction.
+// Because a tx can become invalid after once being considered valid, validity
 // should be verified again on every call. An error will be returned if this
-// UTXO is no longer ready to spend. An unmined transaction should have zero
+// TXIO is no longer ready to spend. An unmined transaction should have zero
 // confirmations. A transaction in the current best block should have one
 // confirmation. The value -1 will be returned with any error.
-func (utxo *UTXO) Confirmations() (int64, error) {
-	btc := utxo.btc
+func (txio *TXIO) confirmations() (int64, error) {
+	btc := txio.btc
 	tipHash := btc.blockCache.tipHash()
-	// If the UTXO was in a mempool transaction, check if it has been confirmed.
-	if utxo.height == 0 {
+	// If the tx was a mempool transaction, check if it has been confirmed.
+	if txio.height == 0 {
 		// If the tip hasn't changed, don't do anything here.
-		if utxo.lastLookup == nil || *utxo.lastLookup != tipHash {
-			utxo.lastLookup = &tipHash
-			txOut, verboseTx, _, err := btc.getTxOutInfo(&utxo.txHash, utxo.vout)
+		if txio.lastLookup == nil || *txio.lastLookup != tipHash {
+			txio.lastLookup = &tipHash
+			verboseTx, err := txio.btc.node.GetRawTransactionVerbose(&txio.tx.hash)
 			if err != nil {
-				return -1, err
+				return -1, fmt.Errorf("GetRawTransactionVerbose for txid %s: %v", txio.tx.hash, err)
 			}
 			// More than zero confirmations would indicate that the transaction has
-			// been mined. Collect the block info and update the utxo fields.
-			if txOut.Confirmations > 0 {
-				blk, err := btc.getBlockInfo(verboseTx.BlockHash)
+			// been mined. Collect the block info and update the tx fields.
+			if verboseTx.Confirmations > 0 {
+				blk, err := txio.btc.getBlockInfo(verboseTx.BlockHash)
 				if err != nil {
 					return -1, err
 				}
-				utxo.height = blk.height
-				utxo.blockHash = blk.hash
+				txio.height = blk.height
+				txio.blockHash = blk.hash
 			}
+			return int64(verboseTx.Confirmations), nil
 		}
 	} else {
-		// The UTXO was included in a block, but make sure that the utxo's block has
+		// The tx was included in a block, but make sure that the tx's block has
 		// not been orphaned.
-		mainchainBlock, found := btc.blockCache.atHeight(utxo.height)
-		if !found {
-			return -1, fmt.Errorf("no mainchain block for tx %s at height %d", utxo.txHash.String(), utxo.height)
-		}
-		// If the UTXO's block has been orphaned, check for a new containing block.
-		if mainchainBlock.hash != utxo.blockHash {
-			// See if we can find the utxo in another block.
-			newUtxo, err := btc.utxo(&utxo.txHash, utxo.vout, utxo.redeemScript)
-			if err != nil {
-				return -1, fmt.Errorf("utxo block is not mainchain")
-			}
-			*utxo = *newUtxo
+		mainchainBlock, found := btc.blockCache.atHeight(txio.height)
+		if !found || mainchainBlock.hash != txio.blockHash {
+			return -1, ErrReorgDetected
 		}
 	}
 	// If the height is still 0, this is a mempool transaction.
-	if utxo.height == 0 {
+	if txio.height == 0 {
 		return 0, nil
 	}
 	// Otherwise just check that there hasn't been a reorg which would render the
 	// output immature. This would be exceedingly rare (impossible?).
-	confs := int32(btc.blockCache.tipHeight()) - int32(utxo.height) + 1
-	if confs < utxo.maturity {
-		return -1, fmt.Errorf("transaction %s became immature", utxo.txHash)
+	confs := int32(btc.blockCache.tipHeight()) - int32(txio.height) + 1
+	if confs < txio.maturity {
+		return -1, fmt.Errorf("transaction %s became immature", txio.tx.hash)
 	}
 	return int64(confs), nil
 }
 
-// Auth verifies that the utxo pays to the supplied public key(s). This is an
-// asset.DEXAsset method.
-func (utxo *UTXO) Auth(pubkeys, sigs [][]byte, msg []byte) error {
+// TxID is a string identifier for the transaction, typically a hexadecimal
+// representation of the byte-reversed transaction hash.
+func (txio *TXIO) TxID() string {
+	return txio.tx.hash.String()
+}
+
+// FeeRate returns the transaction fee rate, in satoshi/vbyte.
+func (txio *TXIO) FeeRate() uint64 {
+	return txio.tx.feeRate
+}
+
+// Input is a transaction input.
+type Input struct {
+	TXIO
+	vin uint32
+}
+
+var _ asset.Coin = (*Input)(nil)
+
+// Value is the value of the previous output spent by the input.
+func (input *Input) Value() uint64 {
+	return input.TXIO.tx.ins[input.vin].value
+}
+
+// String creates a human-readable representation of a Bitcoin transaction input
+// in the format "{txid = [transaction hash], vin = [input index]}".
+func (input *Input) String() string {
+	return fmt.Sprintf("{txid = %s, vin = %d}", input.TxID(), input.vin)
+}
+
+// Confirmations returns the number of confirmations on this input's
+// transaction.
+func (input *Input) Confirmations() (int64, error) {
+	confs, err := input.confirmations()
+	if err == ErrReorgDetected {
+		newInput, err := input.btc.input(&input.tx.hash, input.vin)
+		if err != nil {
+			return -1, fmt.Errorf("input block is not mainchain")
+		}
+		*input = *newInput
+		return input.Confirmations()
+	}
+	return confs, err
+}
+
+// ID returns the coin ID.
+func (input *Input) ID() []byte {
+	return toCoinID(&input.tx.hash, input.vin)
+}
+
+// spendsCoin checks whether a particular coin is spent in this coin's tx.
+func (input *Input) spendsCoin(coinID []byte) (bool, error) {
+	txHash, vout, err := decodeCoinID(coinID)
+	if err != nil {
+		return false, fmt.Errorf("error decoding coin ID %x: %v", coinID, err)
+	}
+	if uint32(len(input.tx.ins)) < input.vin+1 {
+		return false, nil
+	}
+	txIn := input.tx.ins[input.vin]
+	return txIn.prevTx == *txHash && txIn.vout == vout, nil
+}
+
+// Output represents a transaction output.
+type Output struct {
+	TXIO
+	vout uint32
+	// The output value.
+	value     uint64
+	addresses []string
+	// A bitmask for script type information.
+	scriptType dexbtc.BTCScriptType
+	// If the pkScript, or redeemScript in the case of a P2SH/P2WSH pkScript, is
+	// non-standard according to txscript.
+	nonStandardScript bool
+	// The output's scriptPubkey.
+	pkScript []byte
+	// If the pubkey script is P2SH or P2WSH, the Output will only be generated
+	// if the redeem script is supplied and the script-hash validated. For P2PKH
+	// and P2WPKH pubkey scripts, the redeem script should be nil.
+	redeemScript []byte
+	// numSigs is the number of signatures required to spend this output.
+	numSigs int
+	// spendSize stores the best estimate of the size (bytes) of the serialized
+	// transaction input that spends this Output.
+	spendSize uint32
+}
+
+// Contract is a transaction output containing a swap contract.
+type Contract struct {
+	*Output
+	swapAddress   string
+	refundAddress string
+	lockTime      time.Time
+}
+
+var _ asset.Contract = (*Contract)(nil)
+
+// Confirmations returns the number of confirmations on this output's
+// transaction.
+func (output *Output) Confirmations() (int64, error) {
+	confs, err := output.confirmations()
+	if err == ErrReorgDetected {
+		newOut, err := output.btc.output(&output.tx.hash, output.vout, output.redeemScript)
+		if err != nil {
+			return -1, fmt.Errorf("output block is not mainchain")
+		}
+		*output = *newOut
+		return output.Confirmations()
+	}
+	return confs, err
+}
+
+var _ asset.Coin = (*Output)(nil)
+
+// SpendSize returns the maximum size of the serialized TxIn that spends this
+// output, in bytes. This is a method of the asset.Output interface.
+func (output *Output) SpendSize() uint32 {
+	return output.spendSize
+}
+
+// ID returns the coin ID.
+func (output *Output) ID() []byte {
+	return toCoinID(&output.tx.hash, output.vout)
+}
+
+// Value is the output value, in satoshis.
+func (output *Output) Value() uint64 {
+	return output.value // == output.TXIO.tx.outs[output.vout].value
+}
+
+func (output *Output) Addresses() []string {
+	return output.addresses
+}
+
+// String creates a human-readable representation of a Bitcoin transaction output
+// in the format "{txid = [transaction hash], vout = [output index]}".
+func (output *Output) String() string {
+	return fmt.Sprintf("{txid = %s, vout = %d}", output.TxID(), output.vout)
+}
+
+// Auth verifies that the output pays to the supplied public key(s). This is an
+// asset.Backend method.
+func (output *Output) Auth(pubkeys, sigs [][]byte, msg []byte) error {
 	// If there are not enough pubkeys, no reason to check anything.
-	if len(pubkeys) < utxo.numSigs {
-		return fmt.Errorf("not enough signatures for utxo %s:%d. expected %d, got %d",
-			utxo.txHash, utxo.vout, utxo.numSigs, len(pubkeys))
+	if len(pubkeys) < output.numSigs {
+		return fmt.Errorf("not enough signatures for output %s:%d. expected %d, got %d",
+			output.tx.hash, output.vout, output.numSigs, len(pubkeys))
 	}
 	// Extract the addresses from the pubkey scripts and redeem scripts.
-	evalScript := utxo.pkScript
-	if utxo.scriptType.isP2SH() {
-		evalScript = utxo.redeemScript
+	evalScript := output.pkScript
+	if output.scriptType.IsP2SH() || output.scriptType.IsP2WSH() {
+		evalScript = output.redeemScript
 	}
-	scriptAddrs, err := extractScriptAddrs(evalScript, utxo.btc.chainParams)
+	scriptAddrs, nonStandard, err := dexbtc.ExtractScriptAddrs(evalScript, output.btc.chainParams)
 	if err != nil {
 		return err
 	}
-	// Sanity check that the required signature count matches the count parsed
-	// during UTXO initialization.
-	if scriptAddrs.nRequired != utxo.numSigs {
-		return fmt.Errorf("signature requirement mismatch for utxo %s:%d. %d != %d",
-			utxo.txHash, utxo.vout, scriptAddrs.nRequired, utxo.numSigs)
+	if nonStandard {
+		return fmt.Errorf("non-standard script")
 	}
-	matches := append(pkMatches(pubkeys, scriptAddrs.pubkeys, nil),
-		pkMatches(pubkeys, scriptAddrs.pkHashes, btcutil.Hash160)...)
-	if len(matches) < utxo.numSigs {
-		return fmt.Errorf("not enough pubkey matches to satisfy the script for utxo %s:%d. expected %d, got %d",
-			utxo.txHash, utxo.vout, utxo.numSigs, len(matches))
+	// Ensure that at least 1 signature is required to spend this output.
+	// Non-standard scripts are already be caught, but check again here in case
+	// this can happen another way. Note that Auth may be called via an
+	// interface, where this requirement may not fit into a generic spendability
+	// check.
+	if scriptAddrs.NRequired == 0 {
+		return fmt.Errorf("script requires no signatures to spend")
+	}
+	// Sanity check that the required signature count matches the count parsed
+	// during output initialization.
+	if scriptAddrs.NRequired != output.numSigs {
+		return fmt.Errorf("signature requirement mismatch. required: %d, matched: %d",
+			scriptAddrs.NRequired, output.numSigs)
+	}
+	matches := append(pkMatches(pubkeys, scriptAddrs.PubKeys, nil),
+		pkMatches(pubkeys, scriptAddrs.PkHashes, btcutil.Hash160)...)
+	if len(matches) < output.numSigs {
+		return fmt.Errorf("not enough pubkey matches to satisfy the script for output %s:%d. expected %d, got %d",
+			output.tx.hash, output.vout, output.numSigs, len(matches))
 	}
 	for _, match := range matches {
 		err := checkSig(msg, match.pubkey, sigs[match.idx])
@@ -143,6 +277,35 @@ func (utxo *UTXO) Auth(pubkeys, sigs [][]byte, msg []byte) error {
 	}
 	return nil
 }
+
+// TODO: Eliminate the UTXO type. Instead use Output (asset.Coin) and check for
+// spendability in the consumer as needed. This is left as is to retain current
+// behavior with respect to the unspent requirements.
+
+// A UTXO is information regarding an unspent transaction output.
+type UTXO struct {
+	*Output
+}
+
+// Confirmations returns the number of confirmations on this output's
+// transaction. See also (*Output).Confirmations. This function differs from the
+// Output method in that it is necessary to relocate the utxo after a reorg, it
+// may error if the output is spent.
+func (utxo *UTXO) Confirmations() (int64, error) {
+	confs, err := utxo.confirmations()
+	if err == ErrReorgDetected {
+		// See if we can find the utxo in another block.
+		newUtxo, err := utxo.btc.utxo(&utxo.tx.hash, utxo.vout, utxo.redeemScript)
+		if err != nil {
+			return -1, fmt.Errorf("utxo block is not mainchain")
+		}
+		*utxo = *newUtxo
+		return utxo.Confirmations()
+	}
+	return confs, err
+}
+
+var _ asset.FundingCoin = (*UTXO)(nil)
 
 type pkMatch struct {
 	pubkey []byte
@@ -177,30 +340,64 @@ func pkMatches(pubkeys [][]byte, addrs []btcutil.Address, hasher func([]byte) []
 	return matches
 }
 
-// SpendSize returns the maximum size of the serialized TxIn that spends this
-// UTXO, in bytes. This is a method of the asset.UTXO interface.
-func (utxo *UTXO) SpendSize() uint32 {
-	return utxo.spendSize
+// auditContract checks that output is a swap contract and extracts the
+// receiving address and contract value on success.
+func (contract *Contract) auditContract() error {
+	tx := contract.tx
+	if len(tx.outs) <= int(contract.vout) {
+		return fmt.Errorf("invalid index %d for transaction %s", contract.vout, tx.hash)
+	}
+	output := tx.outs[int(contract.vout)]
+
+	// If it's a pay-to-script-hash, extract the script hash and check it against
+	// the hash of the user-supplied redeem script.
+	scriptType := dexbtc.ParseScriptType(output.pkScript, contract.redeemScript)
+	if scriptType == dexbtc.ScriptUnsupported {
+		return fmt.Errorf("specified output %s:%d is not P2SH", tx.hash, contract.vout)
+	}
+	var scriptHash, hashed []byte
+	if scriptType.IsP2SH() || scriptType.IsP2WSH() {
+		scriptHash = dexbtc.ExtractScriptHash(output.pkScript)
+		if scriptType.IsSegwit() {
+			shash := sha256.Sum256(contract.redeemScript)
+			hashed = shash[:]
+		} else {
+			hashed = btcutil.Hash160(contract.redeemScript)
+		}
+	}
+	if scriptHash == nil {
+		return fmt.Errorf("specified output %s:%d is not P2SH or P2WSH", tx.hash, contract.vout)
+	}
+	if !bytes.Equal(hashed, scriptHash) {
+		return fmt.Errorf("swap contract hash mismatch for %s:%d", tx.hash, contract.vout)
+	}
+	refund, receiver, lockTime, _, err := dexbtc.ExtractSwapDetails(contract.redeemScript, contract.btc.chainParams)
+	if err != nil {
+		return fmt.Errorf("error parsing swap contract for %s:%d: %v", tx.hash, contract.vout, err)
+	}
+	contract.refundAddress = refund.String()
+	contract.swapAddress = receiver.String()
+	contract.lockTime = time.Unix(int64(lockTime), 0)
+	return nil
 }
 
-// TxHash is a byte-slice of the UTXO's transaction hash.
-func (utxo *UTXO) TxHash() []byte {
-	return utxo.txHash.CloneBytes()
+// RefundAddress is the refund address of this swap contract.
+func (contract *Contract) RefundAddress() string {
+	return contract.refundAddress
 }
 
-// TxID is a string identifier for the transaction, typically a hexadecimal
-// representation of the byte-reversed transaction hash. Should always return
-// the same value as the txid argument passed to (DEXAsset).UTXO.
-func (utxo *UTXO) TxID() string {
-	return utxo.txHash.String()
+// SwapAddress is the receiving address of this swap contract.
+func (contract *Contract) SwapAddress() string {
+	return contract.swapAddress
 }
 
-// Vout is the output index of the UTXO.
-func (utxo *UTXO) Vout() uint32 {
-	return utxo.vout
+// RedeemScript returns the Contract's redeem script.
+func (contract *Contract) RedeemScript() []byte {
+	return contract.redeemScript
 }
 
-// Value is the output value, in atoms.
-func (utxo *UTXO) Value() uint64 {
-	return utxo.value
+// LockTime is a method on the asset.Contract interface for reading the locktime
+// in the contract script.
+func (contract *Contract) LockTime() time.Time {
+	return contract.lockTime
 }

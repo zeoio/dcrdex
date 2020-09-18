@@ -4,84 +4,47 @@
 package comms
 
 import (
-	"encoding/json"
-	"io"
 	"sync"
 	"time"
 
-	"github.com/decred/dcrdex/server/comms/msgjson"
-	"github.com/gorilla/websocket"
+	"decred.org/dcrdex/dex/msgjson"
+	"decred.org/dcrdex/dex/ws"
 )
-
-// outBufferSize is the size of the client's buffered channel for outgoing
-// messages.
-const outBufferSize = 128
-
-// Error is just a basic error.
-type Error string
-
-// Error satisfies the error interface.
-func (e Error) Error() string {
-	return string(e)
-}
-
-// ErrClientDisconnected will be returned if Send or Request is called on a
-// disconnected link.
-const ErrClientDisconnected = Error("client disconnected")
 
 // Link is an interface for a communication channel with an API client. The
 // reference implementation of a Link-satisfying type is the wsLink, which
 // passes messages over a websocket connection.
 type Link interface {
-	// ID will return a unique ID by which this connection can be identified.
+	// ID returns a unique ID by which this connection can be identified.
 	ID() uint64
-	// Send sends the msgjson.Message to the client.
+	// IP returns the IP address of the peer.
+	IP() string
+	// Send sends the msgjson.Message to the peer.
 	Send(msg *msgjson.Message) error
+	// SendError sends the msgjson.Error to the peer, with reference to a
+	// request message ID.
+	SendError(id uint64, rpcErr *msgjson.Error)
 	// Request sends the Request-type msgjson.Message to the client and registers
 	// a handler for the response.
-	Request(msg *msgjson.Message, f func(Link, *msgjson.Message)) error
+	Request(msg *msgjson.Message, f func(Link, *msgjson.Message), expireTime time.Duration, expire func()) error
 	// Banish closes the link and quarantines the client.
 	Banish()
-}
-
-// wsConnection represents a websocket connection to the client. In practice,
-// it is satisfied by *websocket.Conn. For testing, a stub can be used.
-type wsConnection interface {
-	ReadMessage() (int, []byte, error)
-	WriteMessage(int, []byte) error
-	Close() error
+	// Disconnect closes the link.
+	Disconnect()
 }
 
 // When the DEX sends a request to the client, a responseHandler is created
 // to wait for the response.
 type responseHandler struct {
-	expiration time.Time
-	f          func(Link, *msgjson.Message)
+	f      func(Link, *msgjson.Message)
+	expire *time.Timer
 }
 
 // wsLink is the local, per-connection representation of a DEX client.
 type wsLink struct {
+	*ws.WSLink
 	// The id is the unique identifier assigned to this client.
 	id uint64
-	// ip is the client's IP address.
-	ip string
-	// conn is the gorilla websocket.Conn, or a stub for testing.
-	conn wsConnection
-	// quitMtx protects the on flag and closing of the quit channel.
-	quitMtx sync.RWMutex
-	// on is used internally to prevent multiple Close calls on the underlying
-	// connections.
-	on bool
-	// Once the client is disconnected, the quit channel will be closed.
-	quit chan struct{}
-	// wg is the client's WaitGroup. The client has at least 3 goroutines, one for
-	// read, one for write, and one server goroutine to monitor the client
-	// disconnect. The WaitGroup is used to synchronize cleanup on disconnection.
-	wg sync.WaitGroup
-	// Messages to the client are routed through the outChan. This ensures
-	// messages are sent in the correct order, and satisfies the thread-safety
-	// requirements of the (*websocket.Conn).WriteMessage.
-	outChan chan []byte
 	// For DEX-originating requests, the response handler is mapped to the
 	// resquest ID.
 	reqMtx       sync.Mutex
@@ -92,250 +55,132 @@ type wsLink struct {
 }
 
 // newWSLink is a constructor for a new wsLink.
-func newWSLink(addr string, conn wsConnection) *wsLink {
-	return &wsLink{
-		on:           true,
-		ip:           addr,
-		conn:         conn,
-		quit:         make(chan struct{}),
-		outChan:      make(chan []byte, outBufferSize),
+func newWSLink(addr string, conn ws.Connection) *wsLink {
+	var c *wsLink
+	c = &wsLink{
+		WSLink: ws.NewWSLink(addr, conn, pingPeriod, func(msg *msgjson.Message) *msgjson.Error {
+			return handleMessage(c, msg)
+		}),
 		respHandlers: make(map[uint64]*responseHandler),
 	}
-}
-
-// Send sends the passed Message to the websocket client. If the client's
-// channel if blocking (outBufferSize pending messages), the client is
-// disconnected.
-func (c *wsLink) Send(msg *msgjson.Message) error {
-	if c.off() {
-		return ErrClientDisconnected
-	}
-	b, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	select {
-	case c.outChan <- b:
-	case <-c.quit:
-		return ErrClientDisconnected
-	}
-	return nil
-}
-
-// Request sends the message to the client and tracks the response handler.
-func (c *wsLink) Request(msg *msgjson.Message, f func(conn Link, msg *msgjson.Message)) error {
-	c.logReq(msg.ID, f)
-	return c.Send(msg)
+	return c
 }
 
 // Banish sets the ban flag and closes the client.
 func (c *wsLink) Banish() {
 	c.ban = true
-	c.disconnect()
+	c.Disconnect()
 }
 
+// ID returns a unique ID by which this connection can be identified.
 func (c *wsLink) ID() uint64 {
 	return c.id
 }
 
-// sendError sends the msgjson.Error to the client.
-func (c *wsLink) sendError(id uint64, rpcErr *msgjson.Error) {
-	msg, err := msgjson.NewResponse(id, nil, rpcErr)
-	if err != nil {
-		log.Errorf("sendError: failed to create message: %v", err)
-	}
-	err = c.Send(msg)
-	if err != nil {
-		log.Debug("sendError: failed to send message to %s: %v", c.ip, err)
-	}
+// IP returns the IP address of the peer.
+func (c *wsLink) IP() string {
+	return c.WSLink.IP()
 }
 
-// start begins processing input and output messages.
-func (c *wsLink) start() {
-	log.Tracef("Starting websocket client %s", c.ip)
-
-	// Start processing input and output.
-	c.wg.Add(2)
-	go c.inHandler()
-	go c.outHandler()
-}
-
-// disconnect closes both the underlying websocket connection and the quit
-// channel.
-func (c *wsLink) disconnect() {
-	c.quitMtx.Lock()
-	defer c.quitMtx.Unlock()
-	if !c.on {
-		return
+// The WSLink.handler for WSLink.inHandler
+func handleMessage(c *wsLink, msg *msgjson.Message) *msgjson.Error {
+	switch msg.Type {
+	case msgjson.Request:
+		if msg.ID == 0 {
+			return msgjson.NewError(msgjson.RPCParseError, "request id cannot be zero")
+		}
+		// Look for a registered handler. Failure to find a handler results in an
+		// error response but not a disconnect.
+		handler := RouteHandler(msg.Route)
+		if handler == nil {
+			return msgjson.NewError(msgjson.RPCUnknownRoute, "unknown route "+msg.Route)
+		}
+		// Handle the request.
+		return handler(c, msg)
+	case msgjson.Response:
+		// NOTE: In the event of an error, we respond to a response, which makes
+		// no sense. A new mechanism is needed with appropriate client handling.
+		if msg.ID == 0 {
+			return msgjson.NewError(msgjson.RPCParseError, "response id cannot be 0")
+		}
+		cb := c.respHandler(msg.ID)
+		if cb == nil {
+			log.Debugf("comms.handleMessage: handler for msg ID %d not found", msg.ID)
+			return msgjson.NewError(msgjson.UnknownResponseID,
+				"unknown response ID")
+		}
+		cb.f(c, msg)
+		return nil
 	}
-	c.on = false
-	c.conn.Close()
-	close(c.quit)
+	return msgjson.NewError(msgjson.UnknownMessageType, "unknown message type")
 }
 
-// waitForShutdown blocks until the websocket client goroutines are stopped
-// and the connection is closed.
-func (c *wsLink) waitForShutdown() {
-	c.wg.Wait()
-}
-
-// inHandler handles all incoming messages for the websocket connection. It must
-// be run as a goroutine.
-func (c *wsLink) inHandler() {
-out:
-	for {
-		// Break out of the loop once the quit channel has been closed.
-		// Use a non-blocking select here so we fall through otherwise.
-		select {
-		case <-c.quit:
-			break out
-		default:
-		}
-		// Block until a message is received or an error occurs.
-		_, msgBytes, err := c.conn.ReadMessage()
-		if err != nil {
-			// Log the error if it's not due to disconnecting.
-			if err != io.EOF {
-				log.Errorf("Websocket receive error from %s: %v", c.ip, err)
-			}
-			break out
-		}
-		// Attempt to unmarshal the request. Only requests that successfully decode
-		// will be accepted by the server, though failure to decode does not force
-		// a disconnect.
-		msg := new(msgjson.Message)
-		err = json.Unmarshal(msgBytes, msg)
-		if err != nil {
-			c.sendError(1, msgjson.NewError(msgjson.RPCParseError,
-				"Failed to parse message: "+err.Error()))
-			continue
-		}
-		switch msg.Type {
-		case msgjson.Request:
-			if msg.ID == 0 {
-				c.sendError(1, msgjson.NewError(msgjson.RPCParseError, "request id cannot be zero"))
-				break
-			}
-			// Look for a registered handler. Failure to find a handler results in an
-			// error response but not a disconnect.
-			handler, found := rpcRoutes[msg.Route]
-			if !found {
-				c.sendError(msg.ID, msgjson.NewError(msgjson.RPCUnknownRoute,
-					"unknown route "+msg.Route))
-				continue
-			}
-			// Handle the request.
-			rpcError := handler(c, msg)
-			if rpcError != nil {
-				c.sendError(msg.ID, rpcError)
-				continue
-			}
-		case msgjson.Response:
-			if msg.ID == 0 {
-				c.sendError(1, msgjson.NewError(msgjson.RPCParseError, "response id cannot be 0"))
-				continue
-			}
-			cb := c.respHandler(msg.ID)
-			if cb == nil {
-				c.sendError(msg.ID, msgjson.NewError(msgjson.UnknownResponseID,
-					"unknown response ID"))
-				continue
-			}
-			cb.f(c, msg)
-		}
-	}
-	// Ensure the connection is closed.
-	c.disconnect()
-	c.wg.Done()
-}
-
-// outHandler handles all outgoing messages for the websocket connection.
-// It uses a buffered channel to serialize output messages while allowing the
-// sender to continue running asynchronously.  It must be run as a goroutine.
-func (c *wsLink) outHandler() {
-	ticker := time.NewTicker(pingPeriod)
-	ping := []byte{}
-out:
-	for {
-		// Send any messages ready for send until the quit channel is
-		// closed.
-		select {
-		case b := <-c.outChan:
-			err := c.conn.WriteMessage(websocket.TextMessage, b)
-			if err != nil {
-				c.disconnect()
-				break out
-			}
-		case <-ticker.C:
-			err := c.conn.WriteMessage(websocket.PingMessage, ping)
-			if err != nil {
-				c.disconnect()
-				// Don't really care what the error is, but log it at debug level.
-				log.Debugf("WriteMessage ping error: %v", err)
-				break out
-			}
-		case <-c.quit:
-			break out
-		}
-	}
-
-	// Drain any wait channels before exiting so nothing is left waiting
-	// around to send.
-cleanup:
-	for {
-		select {
-		case <-c.outChan:
-		default:
-			break cleanup
-		}
-	}
-	c.wg.Done()
-	log.Tracef("Websocket client output handler done for %s", c.ip)
-}
-
-// cleanUpExpired cleans up the response handler map.
-func (c *wsLink) cleanUpExpired() {
+func (c *wsLink) expire(id uint64) bool {
 	c.reqMtx.Lock()
 	defer c.reqMtx.Unlock()
-	var expired []uint64
-	for id, cb := range c.respHandlers {
-		if time.Until(cb.expiration) < 0 {
-			expired = append(expired, id)
-		}
-	}
-	for _, id := range expired {
-		delete(c.respHandlers, id)
-	}
+	_, removed := c.respHandlers[id]
+	delete(c.respHandlers, id)
+	return removed
 }
 
 // logReq stores the response handler in the respHandlers map. Requests to the
 // client are associated with a response handler.
-func (c *wsLink) logReq(id uint64, respHandler func(Link, *msgjson.Message)) {
+func (c *wsLink) logReq(id uint64, respHandler func(Link, *msgjson.Message), expireTime time.Duration, expire func()) {
 	c.reqMtx.Lock()
 	defer c.reqMtx.Unlock()
-	c.respHandlers[id] = &responseHandler{
-		expiration: time.Now().Add(time.Minute * 5),
-		f:          respHandler,
+	doExpire := func() {
+		// Delete the response handler, and call the provided expire function if
+		// (*wsLink).respHandler has not already retrieved the handler function
+		// for execution.
+		if c.expire(id) {
+			expire()
+		}
 	}
-	// clean up the response map.
-	go c.cleanUpExpired()
+	c.respHandlers[id] = &responseHandler{
+		f:      respHandler,
+		expire: time.AfterFunc(expireTime, doExpire),
+	}
+}
+
+// Request sends the message to the client and tracks the response handler. If
+// the response handler is called, it is guaranteed that the request Message.ID
+// is equal to the response Message.ID passed to the handler (see the
+// msgjson.Response case in handleMessage).
+func (c *wsLink) Request(msg *msgjson.Message, f func(conn Link, msg *msgjson.Message), expireTime time.Duration, expire func()) error {
+	// log.Tracef("Registering '%s' request ID %d (wsLink)", msg.Route, msg.ID)
+	c.logReq(msg.ID, f, expireTime, expire)
+	// Send errors are (1) connection is already down or (2) json marshal
+	// failure. Any connection write errors just cause the link to quit as the
+	// goroutine that actually does the write does not relay any errors back to
+	// the caller. The request will eventually expire when no response comes.
+	// This is not ideal - we may consider an error callback, or different
+	// Send/SendNow/QueueSend functions.
+	err := c.Send(msg)
+	if err != nil {
+		// Neither expire nor the handler should run. Stop the expire timer
+		// created by logReq and delete the response handler it added. The
+		// caller receives a non-nil error to deal with it.
+		log.Debugf("(*wsLink).Request(route '%s') Send error, unregistering msg ID %d handler: %v",
+			msg.Route, msg.ID, err)
+		c.respHandler(msg.ID) // drop the removed responseHandler
+	}
+	return err
 }
 
 // respHandler extracts the response handler for the provided request ID if it
-// exists, else nil. If the handler exists, it will be deleted from the map.
+// exists, else nil. If the handler exists, it will be deleted from the map and
+// the expire Timer stopped.
 func (c *wsLink) respHandler(id uint64) *responseHandler {
 	c.reqMtx.Lock()
 	defer c.reqMtx.Unlock()
 	cb, ok := c.respHandlers[id]
 	if ok {
+		// Stop the expiration Timer. If the Timer fired after respHandler was
+		// called, but we found the response handler in the map, wsLink.expire
+		// is waiting for the reqMtx lock and will return false, thus preventing
+		// the registered expire func from executing.
+		cb.expire.Stop()
 		delete(c.respHandlers, id)
 	}
 	return cb
-}
-
-// off will return true if the client has disconnected.
-func (c *wsLink) off() bool {
-	c.quitMtx.RLock()
-	defer c.quitMtx.RUnlock()
-	return !c.on
 }

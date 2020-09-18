@@ -4,13 +4,12 @@
 package book
 
 import (
-	"os"
 	"testing"
 	"time"
 
-	"github.com/decred/dcrdex/server/account"
-	"github.com/decred/dcrdex/server/order"
-	"github.com/decred/slog"
+	"decred.org/dcrdex/dex"
+	"decred.org/dcrdex/dex/order"
+	"decred.org/dcrdex/server/account"
 )
 
 // An arbitrary account ID for test orders.
@@ -28,8 +27,7 @@ const (
 )
 
 func startLogger() {
-	logger := slog.NewBackend(os.Stdout).Logger("BOOKTEST")
-	logger.SetLevel(slog.LevelDebug)
+	logger := dex.StdOutLogger("BOOKTEST", dex.LevelTrace)
 	UseLogger(logger)
 }
 
@@ -39,16 +37,16 @@ func newLimitOrder(sell bool, rate, quantityLots uint64, force order.TimeInForce
 		addr = "149RQGLaHf2gGiL4NXZdH7aA8nYEuLLrgm"
 	}
 	return &order.LimitOrder{
-		MarketOrder: order.MarketOrder{
-			Prefix: order.Prefix{
-				AccountID:  acct0,
-				BaseAsset:  AssetDCR,
-				QuoteAsset: AssetBTC,
-				OrderType:  order.LimitOrderType,
-				ClientTime: time.Unix(1566497653+timeOffset, 0),
-				ServerTime: time.Unix(1566497656+timeOffset, 0),
-			},
-			UTXOs:    []order.Outpoint{},
+		P: order.Prefix{
+			AccountID:  acct0,
+			BaseAsset:  AssetDCR,
+			QuoteAsset: AssetBTC,
+			OrderType:  order.LimitOrderType,
+			ClientTime: time.Unix(1566497653+timeOffset, 0),
+			ServerTime: time.Unix(1566497656+timeOffset, 0),
+		},
+		T: order.Trade{
+			Coins:    []order.CoinID{},
 			Sell:     sell,
 			Quantity: quantityLots * LotSize,
 			Address:  addr,
@@ -110,10 +108,10 @@ func newBook(t *testing.T) *Book {
 
 func resetMakers() {
 	for _, o := range bookBuyOrders {
-		o.Filled = 0
+		o.FillAmt = 0
 	}
 	for _, o := range bookSellOrders {
-		o.Filled = 0
+		o.FillAmt = 0
 	}
 }
 
@@ -198,7 +196,7 @@ func TestBook(t *testing.T) {
 	// Remove not the best buy order.
 	removed, ok = b.Remove(bookBuyOrders[3].ID())
 	if !ok {
-		t.Fatalf("Failed to remove existing buy order %v", bestBuyOrder.ID())
+		t.Fatalf("Failed to remove existing buy order %v", bookBuyOrders[3].ID())
 	}
 	if removed.ID() != bookBuyOrders[3].ID() {
 		t.Errorf("Failed to remove existing buy order. Got %v, wanted %v",
@@ -247,5 +245,21 @@ func TestBook(t *testing.T) {
 	if removed.ID() != bestSellOrder.ID() {
 		t.Errorf("Failed to remove best sell order. Got %v, wanted %v",
 			removed.ID(), bestSellOrder.ID())
+	}
+
+	if b.SellCount() == 0 {
+		t.Errorf("sell side was empty")
+	}
+	if b.BuyCount() == 0 {
+		t.Errorf("buy side was empty")
+	}
+
+	b.Clear()
+
+	if b.SellCount() != 0 {
+		t.Errorf("sell side was not empty after Clear")
+	}
+	if b.BuyCount() != 0 {
+		t.Errorf("buy side was not empty after Clear")
 	}
 }

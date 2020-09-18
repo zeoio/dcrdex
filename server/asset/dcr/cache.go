@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"sync"
 
+	"decred.org/dcrdex/dex"
 	"github.com/decred/dcrd/chaincfg/chainhash"
-	chainjson "github.com/decred/dcrd/rpc/jsonrpc/types"
-	"github.com/decred/dcrdex/server/asset"
+	chainjson "github.com/decred/dcrd/rpc/jsonrpc/types/v2"
 )
 
 // The dcrBlock structure should hold a minimal amount of information about a
@@ -28,11 +28,11 @@ type blockCache struct {
 	blocks    map[chainhash.Hash]*dcrBlock
 	mainchain map[uint32]*dcrBlock
 	best      dcrBlock
-	log       asset.Logger
+	log       dex.Logger
 }
 
 // Constructor for a blockCache.
-func newBlockCache(logger asset.Logger) *blockCache {
+func newBlockCache(logger dex.Logger) *blockCache {
 	return &blockCache{
 		blocks:    make(map[chainhash.Hash]*dcrBlock),
 		mainchain: make(map[uint32]*dcrBlock),
@@ -50,7 +50,7 @@ func (cache *blockCache) block(h *chainhash.Hash) (*dcrBlock, bool) {
 
 // Getter for a mainchain block by its height. This method does not attempt
 // to load the block from the blockchain if it is not found. If that is required
-// use (*dcrBackend).getMainchainDcrBlock.
+// use (*Backend).getMainchainDcrBlock.
 func (cache *blockCache) atHeight(height uint32) (*dcrBlock, bool) {
 	cache.mtx.RLock()
 	defer cache.mtx.RUnlock()
@@ -101,24 +101,31 @@ func (cache *blockCache) tipHash() chainhash.Hash {
 	return cache.best.hash
 }
 
+// Get the best known block height in the blockCache.
+func (cache *blockCache) tip() dcrBlock {
+	cache.mtx.RLock()
+	defer cache.mtx.RUnlock()
+	return cache.best
+}
+
 // Trigger a reorg, setting any blocks at or above the provided height as
 // orphaned and removing them from mainchain, but not the blocks map. reorg
 // clears the best block, so should always be followed with the addition of a
 // new mainchain block.
-func (cache *blockCache) reorg(newTip *chainjson.GetBlockVerboseResult) {
+func (cache *blockCache) reorg(from int64) {
 	cache.mtx.Lock()
 	defer cache.mtx.Unlock()
-	if newTip.Height < 0 {
+	if from < 0 {
 		return
 	}
-	for height := uint32(newTip.Height); height <= cache.best.height; height++ {
+	for height := uint32(from); height <= cache.best.height; height++ {
 		block, found := cache.mainchain[height]
 		if !found {
-			cache.log.Errorf("reorg block not found on mainchain at height %d for a reorg from %d to %d", height, newTip, cache.best.height)
+			cache.log.Errorf("reorg block not found on mainchain at height %d for a reorg from %d to %d", height, from, cache.best.height)
 			continue
 		}
 		// Delete the block from mainchain.
-		delete(cache.mainchain, uint32(block.height))
+		delete(cache.mainchain, block.height)
 		// Store an orphaned block in the blocks cache.
 		cache.blocks[block.hash] = &dcrBlock{
 			hash:     block.hash,

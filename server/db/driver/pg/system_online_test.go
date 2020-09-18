@@ -9,7 +9,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/decred/dcrdex/server/market/types"
+	"decred.org/dcrdex/dex"
 )
 
 const (
@@ -21,9 +21,9 @@ const (
 )
 
 var (
-	archie  *Archiver
-	sqlDb   *sql.DB
-	mktInfo *types.MarketInfo
+	archie            *Archiver
+	mktInfo, mktInfo2 *dex.MarketInfo
+	numMarkets        int
 )
 
 func TestMain(m *testing.M) {
@@ -46,25 +46,35 @@ func TestMain(m *testing.M) {
 
 func openDB() (func() error, error) {
 	var err error
-	mktInfo, err = types.NewMarketInfoFromSymbols("dcr", "btc", LotSize)
+	mktInfo, err = dex.NewMarketInfoFromSymbols("dcr", "btc", LotSize, EpochDuration, MarketBuyBuffer)
+	if err != nil {
+		return func() error { return nil }, fmt.Errorf("invalid market: %v", err)
+	}
+
+	mktInfo2, err = dex.NewMarketInfoFromSymbols("btc", "ltc", LotSize, EpochDuration, MarketBuyBuffer)
 	if err != nil {
 		return func() error { return nil }, fmt.Errorf("invalid market: %v", err)
 	}
 
 	AssetDCR = mktInfo.Base
 	AssetBTC = mktInfo.Quote
+	AssetLTC = mktInfo2.Quote
 
 	dbi := Config{
-		Host:          PGTestsHost,
-		Port:          PGTestsPort,
-		User:          PGTestsUser,
-		Pass:          PGTestsPass,
-		DBName:        PGTestsDBName,
-		HidePGConfig:  true,
-		QueryTimeout:  0, // zero to use the default
-		MarketCfg:     []*types.MarketInfo{mktInfo},
-		CheckedStores: true,
+		Host:         PGTestsHost,
+		Port:         PGTestsPort,
+		User:         PGTestsUser,
+		Pass:         PGTestsPass,
+		DBName:       PGTestsDBName,
+		ShowPGConfig: false,
+		QueryTimeout: 0, // zero to use the default
+		MarketCfg:    []*dex.MarketInfo{mktInfo, mktInfo2},
+		//CheckedStores: true,
+		Net:    dex.Mainnet,
+		FeeKey: "dprv3hCznBesA6jBu1MaSqEBewG76yGtnG6LWMtEXHQvh3MVo6rqesTk7FPMSrczDtEELReV4aGMcrDxc9htac5mBDUEbTi9rgCA8Ss5FkasKM3",
 	}
+
+	numMarkets = len(dbi.MarketCfg)
 
 	closeFn := func() error { return nil }
 
@@ -102,6 +112,7 @@ func detectMarkets(db *sql.DB) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	var markets []string
 	for rows.Next() {
@@ -112,7 +123,10 @@ func detectMarkets(db *sql.DB) ([]string, error) {
 		}
 		markets = append(markets, market)
 	}
-	rows.Close()
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
 
 	return markets, nil
 }
@@ -129,7 +143,7 @@ func nukeAll(db *sql.DB) error {
 
 	// Drop market schemas.
 	for i := range markets {
-		log.Infof(`Dropping market %s schema...`, markets[i])
+		log.Tracef(`Dropping market %s schema...`, markets[i])
 		_, err = db.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE;", markets[i]))
 		if err != nil {
 			return err
@@ -137,15 +151,23 @@ func nukeAll(db *sql.DB) error {
 	}
 
 	// Drop tables in public schema.
-	for i := range createPublicTableStatements {
-		tableName := "public." + createPublicTableStatements[i].name
-		log.Infof(`Dropping DEX table %s...`, tableName)
-		if err = dropTable(db, tableName); err != nil {
-			return err
+	dropPublic := func(stmts []tableStmt) error {
+		for i := range stmts {
+			tableName := "public." + stmts[i].name
+			log.Tracef(`Dropping DEX table %s...`, tableName)
+			if err = dropTable(db, tableName); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
 
-	return nil
+	err = dropPublic(createDEXTableStatements)
+	if err != nil {
+		return err
+	}
+
+	return dropPublic(createAccountTableStatements)
 }
 
 func cleanTables(db *sql.DB) error {
@@ -153,8 +175,46 @@ func cleanTables(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	err = PrepareTables(db, mktConfig())
+	if err != nil {
+		return err
+	}
 
-	return PrepareTables(db, mktConfig())
+	return archie.CreateKeyEntry(archie.keyHash)
+}
+
+func Test_sqlExec(t *testing.T) {
+	// Expect to update 0 rows.
+	stmt := fmt.Sprintf(`UPDATE %s SET lot_size=1234 WHERE name='definitely not a market';`, marketsTableName)
+	N, err := sqlExec(archie.db, stmt)
+	if err != nil {
+		t.Fatal("sqlExec:", err)
+	}
+	if N != 0 {
+		t.Errorf("Should have updated 0 rows without error, got %d", N)
+	}
+
+	// Expect to update 1 rows.
+	stmt = fmt.Sprintf(`UPDATE %s SET lot_size=lot_size WHERE name=$1;`,
+		marketsTableName)
+	N, err = sqlExec(archie.db, stmt, mktInfo.Name)
+	if err != nil {
+		t.Fatal("sqlExec:", err)
+	}
+	if N != 1 {
+		t.Errorf("Should have updated 1 rows without error, got %d", N)
+	}
+
+	// Expect to update N=numMarkets rows.
+	stmt = fmt.Sprintf(`UPDATE %s SET lot_size=lot_size;`,
+		marketsTableName)
+	N, err = sqlExec(archie.db, stmt)
+	if err != nil {
+		t.Fatal("sqlExec:", err)
+	}
+	if N != int64(numMarkets) {
+		t.Errorf("Should have updated %d rows without error, got %d", numMarkets, N)
+	}
 }
 
 func Test_checkCurrentTimeZone(t *testing.T) {

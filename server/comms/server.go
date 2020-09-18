@@ -4,8 +4,10 @@
 package comms
 
 import (
+	"context"
 	"crypto/elliptic"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -16,11 +18,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"decred.org/dcrdex/dex"
+	"decred.org/dcrdex/dex/msgjson"
+	"decred.org/dcrdex/dex/ws"
 	"github.com/decred/dcrd/certgen"
-	"github.com/decred/dcrdex/server/comms/msgjson"
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
-	"github.com/gorilla/websocket"
 )
 
 const (
@@ -38,10 +41,6 @@ const (
 )
 
 var (
-	// websocket.Upgrader is the preferred method of upgrading a request to a
-	// websocket connection.
-	upgrader = websocket.Upgrader{}
-
 	// Time allowed to read the next pong message from the peer. The
 	// default is intended for production, but leaving as a var instead of const
 	// to facilitate testing.
@@ -60,16 +59,16 @@ func NextID() uint64 {
 	return atomic.AddUint64(&idCounter, 1)
 }
 
-// rpcRoute describes a handler for a specific message route.
-type rpcRoute func(Link, *msgjson.Message) *msgjson.Error
+// MsgHandler describes a handler for a specific message route.
+type MsgHandler func(Link, *msgjson.Message) *msgjson.Error
 
 // rpcRoutes maps message routes to the handlers.
-var rpcRoutes = make(map[string]rpcRoute)
+var rpcRoutes = make(map[string]MsgHandler)
 
-// Route registers a RPC handler for a specified route. The handler
-// map is global and has no mutex protection. All calls to Route
-// should be done before the Server is started.
-func Route(route string, handler rpcRoute) {
+// Route registers a handler for a specified route. The handler map is global
+// and has no mutex protection. All calls to Route should be done before the
+// Server is started.
+func Route(route string, handler MsgHandler) {
 	if route == "" {
 		panic("Route: route is empty string")
 	}
@@ -78,6 +77,12 @@ func Route(route string, handler rpcRoute) {
 		panic(fmt.Sprintf("Route: double registration: %s", route))
 	}
 	rpcRoutes[route] = handler
+}
+
+// RouteHandler gets the handler registered to the specified route, if it
+// exists.
+func RouteHandler(route string) MsgHandler {
+	return rpcRoutes[route]
 }
 
 // The RPCConfig is the server configuration settings and the only argument
@@ -99,8 +104,6 @@ type RPCConfig struct {
 // Server is a low-level communications hub. It supports websocket clients
 // and an HTTP API.
 type Server struct {
-	// A WaitGroup for shutdown synchronization.
-	wg sync.WaitGroup
 	// One listener for each address specified at (RPCConfig).ListenAddrs.
 	listeners []net.Listener
 	// Protect the client map, which maps the (link).id to the client itself.
@@ -175,9 +178,9 @@ func NewServer(cfg *RPCConfig) (*Server, error) {
 	}, nil
 }
 
-// Start starts the server. Start should be called only after all routes are
+// Run starts the server. Run should be called only after all routes are
 // registered.
-func (s *Server) Start() {
+func (s *Server) Run(ctx context.Context) {
 	log.Trace("Starting RPC server")
 
 	// Create an HTTP router, putting a couple of useful middlewares in place.
@@ -188,7 +191,10 @@ func (s *Server) Start() {
 		Handler:      mux,
 		ReadTimeout:  rpcTimeoutSeconds * time.Second, // slow requests should not hold connections opened
 		WriteTimeout: rpcTimeoutSeconds * time.Second, // hung responses must die
+		//BaseContext:  func(net.Listener) context.Context { return ctx },
 	}
+
+	var wg sync.WaitGroup
 
 	// Websocket endpoint.
 	mux.Get("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -208,52 +214,54 @@ func (s *Server) Start() {
 			http.Error(w, "server at maximum capacity", http.StatusServiceUnavailable)
 			return
 		}
-		ws, err := upgrader.Upgrade(w, r, nil)
+		wsConn, err := ws.NewConnection(w, r, pongWait)
 		if err != nil {
-			if _, ok := err.(websocket.HandshakeError); !ok {
-				log.Errorf("Unexpected websocket error: %v",
-					err)
-			}
-			http.Error(w, "400 Bad Request.", http.StatusBadRequest)
+			log.Errorf("ws connection error: %v", err)
 			return
 		}
-		pongHandler := func(string) error {
-			return ws.SetReadDeadline(time.Now().Add(pingPeriod + pongWait))
-		}
-		err = pongHandler("")
-		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		ws.SetPongHandler(pongHandler)
-		go s.websocketHandler(ws, ip)
+
+		// http.Server.Shutdown waits for connections to complete (such as this
+		// http.HandlerFunc), but not the long running upgraded websocket
+		// connections. We must wait on each websocketHandler to return in
+		// response to disconnectClients.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.websocketHandler(ctx, wsConn, ip)
+		}()
 	})
 
 	// Start serving.
 	for _, listener := range s.listeners {
-		s.wg.Add(1)
+		wg.Add(1)
 		go func(listener net.Listener) {
 			log.Infof("RPC server listening on %s", listener.Addr())
 			err := httpServer.Serve(listener)
-			if err != http.ErrServerClosed {
+			if !errors.Is(err, http.ErrServerClosed) {
 				log.Warnf("unexpected (http.Server).Serve error: %v", err)
 			}
-			log.Tracef("RPC listener done for %s", listener.Addr())
-			s.wg.Done()
+			log.Debugf("RPC listener done for %s", listener.Addr())
+			wg.Done()
 		}(listener)
 	}
-}
 
-// Stop closes all of the listeners and waits for the WaitGroup.
-func (s *Server) Stop() {
-	log.Warnf("RPC server shutting down")
-	for _, listener := range s.listeners {
-		err := listener.Close()
-		if err != nil {
-			log.Errorf("Problem shutting down rpc: %v", err)
-		}
+	<-ctx.Done()
+
+	// Shutdown the server. This stops all listeners and waits for connections.
+	log.Infof("RPC server shutting down...")
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := httpServer.Shutdown(ctxTimeout)
+	if err != nil {
+		log.Warnf("http.Server.Shutdown: %v", err)
 	}
-	s.wg.Wait()
+
+	// Stop and disconnect websocket clients.
+	s.disconnectClients()
+
+	// When the http.Server is shut down, all websocket clients are gone, and
+	// the listener goroutines have returned, the server is shut down.
+	wg.Wait()
 	log.Infof("RPC server shutdown complete")
 }
 
@@ -284,38 +292,77 @@ func (s *Server) banish(ip string) {
 // websocketHandler handles a new websocket client by creating a new wsClient,
 // starting it, and blocking until the connection closes. This method should be
 // run as a goroutine.
-func (s *Server) websocketHandler(conn wsConnection, ip string) {
-	log.Tracef("New websocket client %s", ip)
+func (s *Server) websocketHandler(ctx context.Context, conn ws.Connection, ip string) {
+	log.Debugf("New websocket client %s", ip)
 
 	// Create a new websocket client to handle the new websocket connection
 	// and wait for it to shutdown.  Once it has shutdown (and hence
 	// disconnected), remove it.
 	client := newWSLink(ip, conn)
-	s.addClient(client)
-	client.start()
-	client.waitForShutdown()
-	s.removeClient(client.id)
+	cm, err := s.addClient(ctx, client)
+	if err != nil {
+		log.Errorf("Failed to add client %s", ip)
+		return
+	}
+	defer s.removeClient(client.id)
+
+	// The connection remains until the connection is lost or the link's
+	// disconnect method is called (e.g. via disconnectClients).
+	cm.Wait()
+
 	// If the ban flag is set, quarantine the client's IP address.
 	if client.ban {
-		s.banish(client.ip)
+		s.banish(client.IP())
 	}
 	log.Tracef("Disconnected websocket client %s", ip)
 }
 
-// addClient assigns the client an ID and adds it to the map.
-func (s *Server) addClient(client *wsLink) {
+// Broadcast sends a message to all connected clients. The message should be a
+// notification. See msgjson.NewNotification.
+func (s *Server) Broadcast(msg *msgjson.Message) {
+	s.clientMtx.RLock()
+	defer s.clientMtx.RUnlock()
+
+	log.Infof("Broadcasting %s for route %s to %d clients...", msg.Type, msg.Route, len(s.clients))
+	if log.Level() <= dex.LevelTrace { // don't marshal unless needed
+		log.Tracef("Broadcast: %q", msg.String())
+	}
+
+	for id, cl := range s.clients {
+		if err := cl.Send(msg); err != nil {
+			log.Debugf("Send to client %d at %s failed: %v", id, cl.IP(), err)
+			cl.Disconnect() // triggers return of websocketHandler, and removeClient
+		}
+	}
+}
+
+// disconnectClients calls disconnect on each wsLink, but does not remove it
+// from the Server's client map.
+func (s *Server) disconnectClients() {
+	s.clientMtx.Lock()
+	for _, link := range s.clients {
+		link.Disconnect()
+	}
+	s.clientMtx.Unlock()
+}
+
+// addClient assigns the client an ID, adds it to the map, and attempts to
+// connect.
+func (s *Server) addClient(ctx context.Context, client *wsLink) (*dex.ConnectionMaster, error) {
 	s.clientMtx.Lock()
 	defer s.clientMtx.Unlock()
 	client.id = s.counter
 	s.counter++
 	s.clients[client.id] = client
+	cm := dex.NewConnectionMaster(client)
+	return cm, cm.Connect(ctx)
 }
 
 // Remove the client from the map.
 func (s *Server) removeClient(id uint64) {
 	s.clientMtx.Lock()
-	defer s.clientMtx.Unlock()
 	delete(s.clients, id)
+	s.clientMtx.Unlock()
 }
 
 // Get the number of active clients.

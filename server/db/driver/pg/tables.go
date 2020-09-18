@@ -7,12 +7,15 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/decred/dcrdex/server/db/driver/pg/internal"
-	"github.com/decred/dcrdex/server/market/types"
+	"decred.org/dcrdex/dex"
+	"decred.org/dcrdex/server/db/driver/pg/internal"
 )
 
 const (
-	marketsTableName = "markets"
+	marketsTableName  = "markets"
+	metaTableName     = "meta"
+	feeKeysTableName  = "fee_keys"
+	accountsTableName = "accounts"
 )
 
 type tableStmt struct {
@@ -20,8 +23,14 @@ type tableStmt struct {
 	stmt string
 }
 
-var createPublicTableStatements = []tableStmt{
+var createDEXTableStatements = []tableStmt{
 	{marketsTableName, internal.CreateMarketsTable},
+	{metaTableName, internal.CreateMetaTable},
+}
+
+var createAccountTableStatements = []tableStmt{
+	{feeKeysTableName, internal.CreateFeeKeysTable},
+	{accountsTableName, internal.CreateAccountsTable},
 }
 
 var createMarketTableStatements = []tableStmt{
@@ -29,15 +38,20 @@ var createMarketTableStatements = []tableStmt{
 	{"orders_active", internal.CreateOrdersTable},
 	{"cancels_archived", internal.CreateCancelOrdersTable},
 	{"cancels_active", internal.CreateCancelOrdersTable},
+	{"matches", internal.CreateMatchesTable}, // just one matches table per market for now
+	{"epochs", internal.CreateEpochsTable},
 }
 
 var tableMap = func() map[string]string {
-	m := make(map[string]string, len(createPublicTableStatements)+
-		len(createMarketTableStatements))
-	for _, pair := range createPublicTableStatements {
+	m := make(map[string]string, len(createDEXTableStatements)+
+		len(createMarketTableStatements)+len(createAccountTableStatements))
+	for _, pair := range createDEXTableStatements {
 		m[pair.name] = pair.stmt
 	}
 	for _, pair := range createMarketTableStatements {
+		m[pair.name] = pair.stmt
+	}
+	for _, pair := range createAccountTableStatements {
 		m[pair.name] = pair.stmt
 	}
 	return m
@@ -51,7 +65,7 @@ func fullOrderTableName(dbName, marketSchema string, active bool) string {
 		orderTable = "orders_archived"
 	}
 
-	return dbName + "." + marketSchema + "." + orderTable
+	return fullTableName(dbName, marketSchema, orderTable)
 }
 
 func fullCancelOrderTableName(dbName, marketSchema string, active bool) string {
@@ -62,7 +76,15 @@ func fullCancelOrderTableName(dbName, marketSchema string, active bool) string {
 		orderTable = "cancels_archived"
 	}
 
-	return dbName + "." + marketSchema + "." + orderTable
+	return fullTableName(dbName, marketSchema, orderTable)
+}
+
+func fullMatchesTableName(dbName, marketSchema string) string {
+	return dbName + "." + marketSchema + ".matches"
+}
+
+func fullEpochsTableName(dbName, marketSchema string) string {
+	return dbName + "." + marketSchema + ".epochs"
 }
 
 // CreateTable creates one of the known tables by name. The table will be
@@ -75,21 +97,35 @@ func CreateTable(db *sql.DB, schema, tableName string) (bool, error) {
 	}
 
 	if schema == "" {
-		schema = "public"
+		schema = publicSchema
 	}
 	return createTable(db, createCommand, schema, tableName)
 }
 
 // PrepareTables ensures that all tables required by the DEX market config,
 // mktConfig, are ready.
-func PrepareTables(db *sql.DB, mktConfig []*types.MarketInfo) error {
+func PrepareTables(db *sql.DB, mktConfig []*dex.MarketInfo) error {
+	// Create the meta table in the public schema.
+	created, err := CreateTable(db, publicSchema, metaTableName)
+	if err != nil {
+		return fmt.Errorf("failed to create meta table: %v", err)
+	}
+	if created {
+		log.Trace("Creating new meta table.")
+		_, err := db.Exec(internal.CreateMetaRow)
+		if err != nil {
+			return fmt.Errorf("failed to create row for meta table")
+		}
+
+	}
+
 	// Create the markets table in the public schema.
-	created, err := CreateTable(db, "public", marketsTableName)
+	created, err = CreateTable(db, publicSchema, marketsTableName)
 	if err != nil {
 		return fmt.Errorf("failed to create markets table: %v", err)
 	}
 	if created {
-		log.Warn("Creating new markets table.")
+		log.Trace("Creating new markets table.")
 	}
 
 	// Verify config of existing markets, creating a new markets table if none
@@ -98,18 +134,24 @@ func PrepareTables(db *sql.DB, mktConfig []*types.MarketInfo) error {
 	if err != nil {
 		return err
 	}
+
+	// Prepare the account and registration key counter tables.
+	err = createAccountTables(db)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
 // prepareMarkets ensures that the market-specific tables required by the DEX
 // market config, mktConfig, are ready. See also PrepareTables.
-func prepareMarkets(db *sql.DB, mktConfig []*types.MarketInfo) (map[string]*types.MarketInfo, error) {
+func prepareMarkets(db *sql.DB, mktConfig []*dex.MarketInfo) (map[string]*dex.MarketInfo, error) {
 	// Load existing markets and ensure there aren't multiple with the same ID.
 	mkts, err := loadMarkets(db, marketsTableName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read markets table: %v", err)
 	}
-	marketMap := make(map[string]*types.MarketInfo, len(mkts))
+	marketMap := make(map[string]*dex.MarketInfo, len(mkts))
 	for _, mkt := range mkts {
 		if _, found := marketMap[mkt.Name]; found {
 			// should never happen since market name is (unique) primary key
@@ -124,7 +166,7 @@ func prepareMarkets(db *sql.DB, mktConfig []*types.MarketInfo) (map[string]*type
 	for _, mkt := range mktConfig {
 		existingMkt := marketMap[mkt.Name]
 		if existingMkt == nil {
-			log.Infof("New market specified in config: %s", mkt.Name)
+			log.Tracef("New market specified in config: %s", mkt.Name)
 			err = newMarket(db, marketsTableName, mkt)
 			if err != nil {
 				return nil, fmt.Errorf("newMarket failed: %v", err)

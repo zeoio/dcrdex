@@ -9,9 +9,9 @@ import (
 	"os"
 	"path/filepath"
 
+	"decred.org/dcrdex/dex"
 	"github.com/decred/dcrd/chaincfg/v2"
 	"github.com/decred/dcrd/dcrutil/v2"
-	"github.com/decred/dcrdex/server/asset"
 	flags "github.com/jessevdk/go-flags"
 )
 
@@ -22,7 +22,7 @@ const (
 )
 
 var (
-	// A global *chaincfg.Params will be set if tidyConfig completes without
+	// A global *chaincfg.Params will be set if loadConfig completes without
 	// error.
 	chainParams       *chaincfg.Params
 	dcrdHomeDir       = dcrutil.AppDataDir("dcrd", false)
@@ -45,17 +45,17 @@ type DCRConfig struct {
 	// RPCCert is the filepath to the dcrd TLS certificate. If it is not
 	// provided, the default dcrd location will be assumed.
 	RPCCert string `long:"rpccert" description:"File containing the certificate file"`
-	// Context should be cancelled when the program exits. This will cause some
+	// Context should be canceled when the program exits. This will cause some
 	// cleanup to be performed during shutdown.
 	Context context.Context
 }
 
 // loadConfig loads the DCRConfig from file. If no values are found for
-// RPCListen or RPCCert in the specified file, default values will be used.
-// If configPath is an empty string, loadConfig will attempt to read settings
-// directly from the default dcrd.conf filpath. If there is no error, the
+// RPCListen or RPCCert in the specified file, default values will be used. If
+// configPath is an empty string, loadConfig will attempt to read settings
+// directly from the default dcrd.conf file path. If there is no error, the
 // module-level chainParams variable will be set appropriately for the network.
-func loadConfig(configPath string, network asset.Network) (*DCRConfig, error) {
+func loadConfig(configPath string, network dex.Network) (*DCRConfig, error) {
 	// Check for missing credentials. The user and password must be set.
 	cfg := new(DCRConfig)
 
@@ -71,12 +71,12 @@ func loadConfig(configPath string, network asset.Network) (*DCRConfig, error) {
 	}
 
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("no BTC config file found at %s", configPath)
+		return nil, fmt.Errorf("no %q config file found at %s", assetName, configPath)
 	} else {
 		// The config file exists, so attempt to parse it.
 		err = flags.NewIniParser(parser).ParseFile(configPath)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing BTC ini file: %v", err)
+			return nil, fmt.Errorf("error parsing %q ini file: %v", assetName, err)
 		}
 	}
 
@@ -88,20 +88,20 @@ func loadConfig(configPath string, network asset.Network) (*DCRConfig, error) {
 		missing += " password"
 	}
 	if missing != "" {
-		return nil, fmt.Errorf("missing dcrd credentials:%s", missing)
+		return nil, fmt.Errorf("missing dcrd credentials: %s", missing)
 	}
 
 	// Get network settings. Configuration defaults to mainnet, but unknown
 	// non-empty cfg.Net is an error.
 	var defaultServer string
 	switch network {
-	case asset.Simnet:
+	case dex.Simnet:
 		chainParams = chaincfg.SimNetParams()
 		defaultServer = defaultSimnet
-	case asset.Testnet:
+	case dex.Testnet:
 		chainParams = chaincfg.TestNet3Params()
 		defaultServer = defaultTestnet3
-	case asset.Mainnet:
+	case dex.Mainnet:
 		chainParams = chaincfg.MainNetParams()
 		defaultServer = defaultMainnet
 	default:

@@ -7,8 +7,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"testing"
-	"time"
 
+	dexbtc "decred.org/dcrdex/dex/networks/btc"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
@@ -35,6 +35,7 @@ func LiveP2SHStats(btc *Backend, t *testing.T) {
 		swaps        int
 		emptyRedeems int
 		addrErr      int
+		nonStd       int
 		noSigs       int
 	}
 	var stats scriptStats
@@ -79,14 +80,14 @@ out:
 				if err != nil {
 					t.Fatalf("error decoding script from hex %s: %v", prevOutpoint.ScriptPubKey.Hex, err)
 				}
-				scriptType := parseScriptType(pkScript, nil)
-				if scriptType.isP2SH() {
+				scriptType := dexbtc.ParseScriptType(pkScript, nil)
+				if scriptType.IsP2SH() {
 					stats.found++
 					if stats.found > numToDo {
 						break out
 					}
 					var redeemScript []byte
-					if scriptType.isSegwit() {
+					if scriptType.IsSegwit() {
 						// if it's segwit, the script is the last input witness data.
 						redeemHex := txIn.Witness[len(txIn.Witness)-1]
 						redeemScript, err = hex.DecodeString(redeemHex)
@@ -110,11 +111,11 @@ out:
 						}
 						redeemScript = pushed[len(pushed)-1]
 					}
-					scriptType := parseScriptType(pkScript, redeemScript)
+					scriptType := dexbtc.ParseScriptType(pkScript, redeemScript)
 					scriptClass := txscript.GetScriptClass(redeemScript)
 					switch scriptClass {
 					case txscript.MultiSigTy:
-						if !scriptType.isMultiSig() {
+						if !scriptType.IsMultiSig() {
 							t.Fatalf("multi-sig script class but not parsed as multi-sig")
 						}
 						stats.multisig++
@@ -127,7 +128,7 @@ out:
 					case txscript.WitnessV0ScriptHashTy:
 						stats.p2wsh++
 					default:
-						_, _, err = extractSwapAddresses(redeemScript, btc.chainParams)
+						_, _, _, _, err = dexbtc.ExtractSwapDetails(redeemScript, btc.chainParams)
 						if err == nil {
 							stats.swaps++
 							continue
@@ -143,15 +144,18 @@ out:
 						stats.unknown++
 					}
 					evalScript := pkScript
-					if scriptType.isP2SH() {
+					if scriptType.IsP2SH() {
 						evalScript = redeemScript
 					}
-					scriptAddrs, err := extractScriptAddrs(evalScript, btc.chainParams)
+					scriptAddrs, nonStandard, err := dexbtc.ExtractScriptAddrs(evalScript, btc.chainParams)
 					if err != nil {
 						stats.addrErr++
 						continue
 					}
-					if scriptAddrs.nRequired == 0 {
+					if nonStandard {
+						stats.nonStd++
+					}
+					if scriptAddrs.NRequired == 0 {
 						stats.noSigs++
 					}
 				}
@@ -204,7 +208,7 @@ out:
 // blockchain literacy. Ideally, the stats will show no scripts which were
 // unparseable by the backend, but the presence of unknowns is not an error.
 func LiveUTXOStats(btc *Backend, t *testing.T) {
-	numToDo := 10000
+	numToDo := 1000
 	hash, err := btc.node.GetBestBlockHash()
 	if err != nil {
 		t.Fatalf("error getting best block hash: %v", err)
@@ -214,16 +218,17 @@ func LiveUTXOStats(btc *Backend, t *testing.T) {
 		t.Fatalf("error getting best block verbose: %v", err)
 	}
 	type testStats struct {
-		p2pkh   int
-		p2wpkh  int
-		p2sh    int
-		p2wsh   int
-		zeros   int
-		unknown int
-		found   int
-		checked int
-		utxoErr int
-		utxoVal uint64
+		p2pkh    int
+		p2wpkh   int
+		p2sh     int
+		p2wsh    int
+		zeros    int
+		unknown  int
+		found    int
+		checked  int
+		utxoErr  int
+		utxoVal  uint64
+		feeRates []uint64
 	}
 	var stats testStats
 	var unknowns [][]byte
@@ -248,8 +253,8 @@ out:
 				if err != nil {
 					t.Fatalf("error decoding script from hex %s: %v", txOut.ScriptPubKey.Hex, err)
 				}
-				scriptType := parseScriptType(pkScript, nil)
-				if scriptType == scriptUnsupported {
+				scriptType := dexbtc.ParseScriptType(pkScript, nil)
+				if scriptType == dexbtc.ScriptUnsupported {
 					unknowns = append(unknowns, pkScript)
 					stats.unknown++
 					continue
@@ -258,20 +263,20 @@ out:
 				if processed >= numToDo {
 					break out
 				}
-				if scriptType.isP2PKH() {
-					if scriptType.isSegwit() {
+				if scriptType.IsP2PKH() {
+					if scriptType.IsSegwit() {
 						stats.p2wpkh++
 					} else {
 						stats.p2pkh++
 					}
 				} else {
-					if scriptType.isSegwit() {
+					if scriptType.IsSegwit() {
 						stats.p2wsh++
 					} else {
 						stats.p2sh++
 					}
 				}
-				if scriptType.isP2SH() {
+				if scriptType.IsP2SH() {
 					continue
 				}
 				stats.checked++
@@ -280,6 +285,7 @@ out:
 					stats.utxoErr++
 					continue
 				}
+				stats.feeRates = append(stats.feeRates, utxo.FeeRate())
 				stats.found++
 				stats.utxoVal += utxo.Value()
 			}
@@ -317,69 +323,37 @@ out:
 	} else {
 		t.Logf("no unknown script types")
 	}
+	// Fees
+	feeCount := len(stats.feeRates)
+	if feeCount > 0 {
+		var feeSum uint64
+		for _, r := range stats.feeRates {
+			feeSum += r
+		}
+		t.Logf("%d fees, avg rate %d", feeCount, feeSum/uint64(feeCount))
+	}
 }
 
-// LiveFeeRates scans block by block backwards, grabbing the Tx from the
-// backend for each transaction and taking stats on the fees. A mapping of
-// txid -> fee rate can be provided, and those will be checked for equivalence.
+// LiveFeeRates scans a mapping of txid -> fee rate checking that the backend
+// returns the expected fee rate.
 func LiveFeeRates(btc *Backend, t *testing.T, standards map[string]uint64) {
-	type testStats struct {
-		count int
-		sum   int
-		start time.Time
-	}
-	stats := testStats{start: time.Now()}
-	numToDo := 100
-	hash, err := btc.node.GetBestBlockHash()
-	if err != nil {
-		t.Fatalf("error getting best block hash: %v", err)
-	}
-	block, err := btc.node.GetBlockVerbose(hash)
-	if err != nil {
-		t.Fatalf("error getting best block verbose: %v", err)
-	}
-out:
-	for {
-		for _, txid := range block.Tx {
-			txHash, err := chainhash.NewHashFromStr(txid)
-			if err != nil {
-				t.Fatalf("error parsing transaction hash from %s: %v", txid, err)
-			}
-			tx, err := btc.transaction(txHash)
-			if err != nil {
-				t.Fatalf("error retreiving transaction %s: %v", txid, err)
-			}
-			stats.count++
-			stats.sum += int(tx.FeeRate())
-			if stats.count >= numToDo {
-				break out
-			}
-			prevHash, err := chainhash.NewHashFromStr(block.PreviousHash)
-			if err != nil {
-				t.Fatalf("error retrieving block %s: %v", block.PreviousHash, err)
-			}
-			block, err = btc.node.GetBlockVerbose(prevHash)
-			if err != nil {
-				t.Fatalf("error getting block verbose %s: %v", txHash, err)
-			}
-		}
-	}
 	for txid, expRate := range standards {
 		txHash, err := chainhash.NewHashFromStr(txid)
 		if err != nil {
 			t.Fatalf("error parsing transaction hash from %s: %v", txid, err)
 		}
-		tx, err := btc.transaction(txHash)
+		verboseTx, err := btc.node.GetRawTransactionVerbose(txHash)
 		if err != nil {
-			t.Fatalf("error retreiving transaction %s", txid)
+			t.Fatalf("error getting raw transaction: %v", err)
 		}
-		feeRate := tx.FeeRate()
-		if feeRate != expRate {
-			t.Fatalf("unexpected fee rate for %s. expected %d, got %d", txid, expRate, feeRate)
+		tx, err := btc.transaction(txHash, verboseTx)
+		if err != nil {
+			t.Fatalf("error retrieving transaction %s", txid)
+		}
+		if tx.feeRate != expRate {
+			t.Fatalf("unexpected fee rate for %s. expected %d, got %d", txid, expRate, tx.feeRate)
 		}
 	}
-	t.Logf("average per-tx fee rate: %d satoshi/byte", stats.sum/stats.count)
-	t.Logf("time per tx: %d ms", time.Since(stats.start).Milliseconds())
 }
 
 // This is an unsupported type of script, but one of the few that is fairly
@@ -435,7 +409,7 @@ func CompatibilityCheck(items *CompatibilityItems, chainParams *chaincfg.Params,
 	}
 
 	// P2PKH
-	pkh := extractPubKeyHash(items.P2PKHScript)
+	pkh := dexbtc.ExtractPubKeyHash(items.P2PKHScript)
 	if pkh == nil {
 		t.Fatalf("incompatible P2PKH script")
 	}
@@ -453,17 +427,21 @@ func CompatibilityCheck(items *CompatibilityItems, chainParams *chaincfg.Params,
 	}
 
 	// P2SH
-	sh := extractScriptHash(items.P2SHScript)
+	sh := dexbtc.ExtractScriptHash(items.P2SHScript)
 	if sh == nil {
 		t.Fatalf("incompatible P2SH script")
 	}
 	checkAddr(items.P2SHScript, items.SHAddr)
 
 	// P2WSH
-	if items.P2WSHScript == nil {
+	if items.P2WSHScript != nil {
 		scriptClass := txscript.GetScriptClass(items.P2WSHScript)
 		if scriptClass != txscript.WitnessV0ScriptHashTy {
 			t.Fatalf("incompatible P2WPKH script")
+		}
+		wsh := dexbtc.ExtractScriptHash(items.P2WSHScript)
+		if wsh == nil {
+			t.Fatalf("incompatible P2WSH script")
 		}
 		checkAddr(items.P2WSHScript, items.WSHAddr)
 	}

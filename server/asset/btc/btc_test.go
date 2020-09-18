@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -21,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"decred.org/dcrdex/dex"
+	dexbtc "decred.org/dcrdex/dex/networks/btc"
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/chaincfg"
@@ -28,15 +31,14 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
-	"github.com/decred/dcrdex/server/asset"
-	"github.com/decred/slog"
-	flags "github.com/jessevdk/go-flags"
+	"gopkg.in/ini.v1"
 )
 
 var (
 	testParams     = &chaincfg.MainNetParams
 	mainnetPort    = 8332
 	blockPollDelay time.Duration
+	defaultHost    = "localhost"
 )
 
 func TestMain(m *testing.M) {
@@ -49,8 +51,8 @@ func TestMain(m *testing.M) {
 
 // TestConfig tests the LoadConfig function.
 func TestConfig(t *testing.T) {
-	cfg := &Config{}
-	parsedCfg := &Config{}
+	cfg := &dexbtc.Config{}
+	parsedCfg := &dexbtc.Config{}
 
 	tempDir, err := ioutil.TempDir("", "btctest")
 	if err != nil {
@@ -58,16 +60,19 @@ func TestConfig(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 	filePath := filepath.Join(tempDir, "test.conf")
-	rootParser := flags.NewParser(cfg, flags.None)
-	iniParser := flags.NewIniParser(rootParser)
 
-	runCfg := func(config *Config) error {
+	runCfg := func(config *dexbtc.Config) error {
 		*cfg = *config
-		err := iniParser.WriteFile(filePath, flags.IniNone)
+		cfgFile := ini.Empty()
+		err := cfgFile.ReflectFrom(cfg)
 		if err != nil {
 			return err
 		}
-		parsedCfg, err = LoadConfig(filePath, asset.Mainnet, btcPorts)
+		err = cfgFile.SaveTo(filePath)
+		if err != nil {
+			return err
+		}
+		parsedCfg, err = dexbtc.LoadConfigFromPath(filePath, assetName, dex.Mainnet, dexbtc.RPCPorts)
 		return err
 	}
 
@@ -78,7 +83,7 @@ func TestConfig(t *testing.T) {
 	}
 
 	// Try with just the name. Error expected.
-	err = runCfg(&Config{
+	err = runCfg(&dexbtc.Config{
 		RPCUser: "somename",
 	})
 	if err == nil {
@@ -86,7 +91,7 @@ func TestConfig(t *testing.T) {
 	}
 
 	// Try with just the password. Error expected.
-	err = runCfg(&Config{
+	err = runCfg(&dexbtc.Config{
 		RPCPass: "somepass",
 	})
 	if err == nil {
@@ -94,7 +99,7 @@ func TestConfig(t *testing.T) {
 	}
 
 	// Give both name and password. This should not be an error.
-	err = runCfg(&Config{
+	err = runCfg(&dexbtc.Config{
 		RPCUser: "somename",
 		RPCPass: "somepass",
 	})
@@ -120,7 +125,7 @@ func TestConfig(t *testing.T) {
 	}
 
 	// Check with a designated port, but no host specified.
-	err = runCfg(&Config{
+	err = runCfg(&dexbtc.Config{
 		RPCUser: "somename",
 		RPCPass: "somepass",
 		RPCPort: 1234,
@@ -141,7 +146,7 @@ func TestConfig(t *testing.T) {
 	}
 
 	// Check with rpcbind set (without designated port) and custom rpcport.
-	err = runCfg(&Config{
+	err = runCfg(&dexbtc.Config{
 		RPCUser: "somename",
 		RPCPass: "somepass",
 		RPCBind: "127.0.0.2",
@@ -163,7 +168,7 @@ func TestConfig(t *testing.T) {
 
 	// Check with a port set with both rpcbind and rpcport. The rpcbind port
 	// should take precedence.
-	err = runCfg(&Config{
+	err = runCfg(&dexbtc.Config{
 		RPCUser: "somename",
 		RPCPass: "somepass",
 		RPCBind: "127.0.0.2:1234",
@@ -184,7 +189,7 @@ func TestConfig(t *testing.T) {
 	}
 
 	// Check with just a port for rpcbind and make sure it gets parsed.
-	err = runCfg(&Config{
+	err = runCfg(&dexbtc.Config{
 		RPCUser: "somename",
 		RPCPass: "somepass",
 		RPCBind: ":1234",
@@ -204,7 +209,7 @@ func TestConfig(t *testing.T) {
 	}
 
 	// IPv6
-	err = runCfg(&Config{
+	err = runCfg(&dexbtc.Config{
 		RPCUser: "somename",
 		RPCPass: "somepass",
 		RPCBind: "[24c2:2865:4c7e:fd9b:76ea:4aa0:263d:6377]:1234",
@@ -261,18 +266,19 @@ type testBlockChain struct {
 
 // The testChain is a "blockchain" to store RPC responses for the Backend
 // node stub to request.
-var testChain testBlockChain
 var testChainMtx sync.RWMutex
+var testChain testBlockChain
+var testBestBlock testBlock
 
 type testBlock struct {
 	hash   chainhash.Hash
 	height uint32
 }
 
-var testBestBlock testBlock
-
 // This must be called before using the testNode.
 func cleanTestChain() {
+	testChainMtx.Lock()
+	defer testChainMtx.Unlock()
 	testBestBlock = testBlock{
 		hash:   zeroHash,
 		height: 0,
@@ -291,6 +297,17 @@ type testNode struct{}
 // Encode utxo info as a concatenated string hash:vout.
 func txOutID(txHash *chainhash.Hash, index uint32) string {
 	return txHash.String() + ":" + strconv.Itoa(int(index))
+}
+
+const optimalFeeRate uint64 = 24
+
+func (testNode) EstimateSmartFee(confTarget int64, mode *btcjson.EstimateSmartFeeMode) (*btcjson.EstimateSmartFeeResult, error) {
+	optimalRate := float64(optimalFeeRate) * 1e-5
+	// fmt.Println((float64(optimalFeeRate)*1e-5)-0.00024)
+	return &btcjson.EstimateSmartFeeResult{
+		Blocks:  2,
+		FeeRate: &optimalRate,
+	}, nil
 }
 
 // Part of the btcNode interface.
@@ -340,12 +357,14 @@ func (t testNode) GetBlockHash(blockHeight int64) (*chainhash.Hash, error) {
 func (t testNode) GetBestBlockHash() (*chainhash.Hash, error) {
 	testChainMtx.RLock()
 	defer testChainMtx.RUnlock()
-	return &testBestBlock.hash, nil
+	bbHash := testBestBlock.hash
+	return &bbHash, nil
 }
 
 // Create a btcjson.GetTxOutResult such as is returned from GetTxOut.
-func testGetTxOut(confirmations int64, pkScript []byte) *btcjson.GetTxOutResult {
+func testGetTxOut(confirmations, value int64, pkScript []byte) *btcjson.GetTxOutResult {
 	return &btcjson.GetTxOutResult{
+		Value:         float64(value) / 1e8,
 		Confirmations: confirmations,
 		ScriptPubKey: btcjson.ScriptPubKeyResult{
 			Hex: hex.EncodeToString(pkScript),
@@ -381,7 +400,7 @@ func testRawTransactionVerbose(msgTx *wire.MsgTx, txid, blockHash *chainhash.Has
 func testAddTxOut(msgTx *wire.MsgTx, vout uint32, txHash, blockHash *chainhash.Hash, blockHeight, confirmations int64) *btcjson.GetTxOutResult {
 	testChainMtx.Lock()
 	defer testChainMtx.Unlock()
-	txOut := testGetTxOut(confirmations, msgTx.TxOut[vout].PkScript)
+	txOut := testGetTxOut(confirmations, msgTx.TxOut[vout].Value, msgTx.TxOut[vout].PkScript)
 	testChain.txOuts[txOutID(txHash, vout)] = txOut
 	testAddTxVerbose(msgTx, txHash, blockHash, confirmations)
 	return txOut
@@ -548,16 +567,16 @@ func testMakeMsgTx(segwit bool) *testMsgTx {
 
 type testMsgTxSwap struct {
 	tx        *wire.MsgTx
-	vout      uint32
 	contract  []byte
 	recipient btcutil.Address
+	refund    btcutil.Address
 }
 
 // Create a swap (initialization) contract with random pubkeys and return the
 // pubkey script and addresses.
-func testSwapContract() ([]byte, btcutil.Address) {
-	lockTime := time.Now().Add(time.Hour * 24).Unix()
-	secretKey := randomBytes(32)
+func testSwapContract() ([]byte, btcutil.Address, btcutil.Address) {
+	lockTime := time.Now().Add(time.Hour * 8).Unix()
+	secretHash := randomBytes(32)
 	_, receiverPKH := genPubkey()
 	_, senderPKH := genPubkey()
 	contract, err := txscript.NewScriptBuilder().
@@ -568,7 +587,7 @@ func testSwapContract() ([]byte, btcutil.Address) {
 		AddOps([]byte{
 			txscript.OP_EQUALVERIFY,
 			txscript.OP_SHA256,
-		}).AddData(secretKey).
+		}).AddData(secretHash).
 		AddOps([]byte{
 			txscript.OP_EQUALVERIFY,
 			txscript.OP_DUP,
@@ -590,12 +609,13 @@ func testSwapContract() ([]byte, btcutil.Address) {
 		fmt.Printf("testSwapContract error: %v\n", err)
 	}
 	receiverAddr, _ := btcutil.NewAddressPubKeyHash(receiverPKH, testParams)
-	return contract, receiverAddr
+	refundAddr, _ := btcutil.NewAddressPubKeyHash(senderPKH, testParams)
+	return contract, receiverAddr, refundAddr
 }
 
-func testMsgTxSwapInit() *testMsgTxSwap {
+func testMsgTxSwapInit(val int64) *testMsgTxSwap {
 	msgTx := wire.NewMsgTx(wire.TxVersion)
-	contract, recipient := testSwapContract()
+	contract, recipient, refund := testSwapContract()
 	scriptHash := btcutil.Hash160(contract)
 	pkScript, err := txscript.NewScriptBuilder().
 		AddOp(txscript.OP_HASH160).
@@ -605,11 +625,12 @@ func testMsgTxSwapInit() *testMsgTxSwap {
 	if err != nil {
 		fmt.Printf("script building error in testMsgTxSwapInit: %v", err)
 	}
-	msgTx.AddTxOut(wire.NewTxOut(1, pkScript))
+	msgTx.AddTxOut(wire.NewTxOut(val, pkScript))
 	return &testMsgTxSwap{
 		tx:        msgTx,
 		contract:  contract,
 		recipient: recipient,
+		refund:    refund,
 	}
 }
 
@@ -630,7 +651,7 @@ type testMsgTxP2SH struct {
 	m      int
 }
 
-// An M-of-N mutli-sig script.
+// An M-of-N multi-sig script.
 func testMultiSigScriptMofN(m, n int) ([]byte, *testMultiSigAuth) {
 	// serialized compressed pubkey used for multisig
 	addrs := make([]*btcutil.AddressPubKey, 0, n)
@@ -638,11 +659,13 @@ func testMultiSigScriptMofN(m, n int) ([]byte, *testMultiSigAuth) {
 		msg: randomBytes(32),
 	}
 
-	for i := 0; i < m; i++ {
+	for i := 0; i < n; i++ {
 		a := s256Auth(auth.msg)
-		auth.pubkeys = append(auth.pubkeys, a.pubkey)
-		auth.pkHashes = append(auth.pkHashes, a.pkHash)
-		auth.sigs = append(auth.sigs, a.sig)
+		if i < m {
+			auth.pubkeys = append(auth.pubkeys, a.pubkey)
+			auth.pkHashes = append(auth.pkHashes, a.pkHash)
+			auth.sigs = append(auth.sigs, a.sig)
+		}
 		addr, err := btcutil.NewAddressPubKey(a.pubkey, testParams)
 		if err != nil {
 			fmt.Printf("error creating AddressSecpPubKey: %v\n", err)
@@ -697,9 +720,19 @@ func testMsgTxP2SHMofN(m, n int, segwit bool) *testMsgTxP2SH {
 
 // Make a backend that logs to stdout.
 func testBackend() (*Backend, func()) {
-	logger := slog.NewBackend(os.Stdout).Logger("TEST")
-	ctx, shutdown := context.WithCancel(context.Background())
-	btc := newBTC(ctx, testParams, logger, testNode{})
+	logger := dex.StdOutLogger("TEST", dex.LevelTrace)
+	btc := newBTC("btc", testParams, logger, testNode{})
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	shutdown := func() {
+		cancel()
+		wg.Wait()
+	}
+	wg.Add(1)
+	go func() {
+		btc.Run(ctx)
+		wg.Done()
+	}()
 	return btc, shutdown
 }
 
@@ -727,8 +760,13 @@ func TestUTXOs(t *testing.T) {
 
 	// A general reset function that clears the testBlockchain and the blockCache.
 	reset := func() {
+		btc.blockCache.mtx.Lock()
+		defer btc.blockCache.mtx.Unlock()
 		cleanTestChain()
-		btc.blockCache = newBlockCache()
+		newBC := newBlockCache()
+		btc.blockCache.blocks = newBC.blocks
+		btc.blockCache.mainchain = newBC.mainchain
+		btc.blockCache.best = newBC.best
 	}
 
 	// CASE 1: A valid UTXO in a mempool transaction
@@ -748,8 +786,9 @@ func TestUTXOs(t *testing.T) {
 	}
 	// While we're here, check the spend script size and value are correct.
 	scriptSize := utxo.SpendSize()
-	if scriptSize != P2PKHSigScriptSize+txInOverhead {
-		t.Fatalf("case 1 - unexpected spend script size reported. expected %d, got %d", P2PKHSigScriptSize, scriptSize)
+	wantScriptSize := uint32(dexbtc.TxInOverhead + 1 + dexbtc.RedeemP2PKHSigScriptSize)
+	if scriptSize != wantScriptSize {
+		t.Fatalf("case 1 - unexpected spend script size reported. expected %d, got %d", wantScriptSize, scriptSize)
 	}
 	if utxo.Value() != 500_000_000 {
 		t.Fatalf("case 1 - unexpected output value. expected 500,000,000, got %d", utxo.Value())
@@ -905,7 +944,7 @@ func TestUTXOs(t *testing.T) {
 		t.Fatalf("case 8 - unexpected error: %v", err)
 	}
 	// Check that the segwit flag is set.
-	if !utxo.scriptType.isSegwit() {
+	if !utxo.scriptType.IsSegwit() {
 		t.Fatalf("case 8 - script type parsed as non-segwit")
 	}
 	err = utxo.Auth([][]byte{msg.auth.pubkey}, [][]byte{msg.auth.sig}, msg.auth.msg)
@@ -925,7 +964,7 @@ func TestUTXOs(t *testing.T) {
 		t.Fatalf("case 9 - received error for utxo: %v", err)
 	}
 	// Check that the script is flagged segwit
-	if !utxo.scriptType.isSegwit() {
+	if !utxo.scriptType.IsSegwit() {
 		t.Fatalf("case 9 - script type parsed as non-segwit")
 	}
 	// Try to get by with just one of the pubkeys.
@@ -950,7 +989,7 @@ func TestUTXOs(t *testing.T) {
 	if err == nil {
 		t.Fatalf("case 10 - no error for immature transaction")
 	}
-	if err != immatureTransactionError {
+	if !errors.Is(err, immatureTransactionError) {
 		t.Fatalf("case 10 - expected immatureTransactionError, got: %v", err)
 	}
 	// Mature the transaction
@@ -961,6 +1000,123 @@ func TestUTXOs(t *testing.T) {
 	_, err = btc.utxo(txHash, msg.vout, nil)
 	if err != nil {
 		t.Fatalf("case 10 - unexpected error after maturing: %v", err)
+	}
+
+	// CASE 11: A swap contract
+	val := int64(5)
+	cleanTestChain()
+	txHash = randomHash()
+	blockHash = randomHash()
+	swap := testMsgTxSwapInit(val)
+	testAddBlockVerbose(blockHash, nil, 1, txHeight)
+	btcVal := btcutil.Amount(val).ToBTC()
+	testAddTxOut(swap.tx, 0, txHash, blockHash, int64(txHeight), 1).Value = btcVal
+	verboseTx := testChain.txRaws[*txHash]
+
+	spentTxHash := randomHash()
+	verboseTx.Vin = append(verboseTx.Vin, testVin(spentTxHash, 0))
+	// We need to add that transaction to the blockchain too, because it will
+	// be requested for the previous outpoint value.
+	spentMsg := testMakeMsgTx(false)
+	spentTx := testAddTxVerbose(spentMsg.tx, spentTxHash, blockHash, 2)
+	spentTx.Vout = []btcjson.Vout{testVout(1, nil)}
+	swapOut := swap.tx.TxOut[0]
+	btcVal = btcutil.Amount(swapOut.Value).ToBTC()
+	verboseTx.Vout = append(verboseTx.Vout, testVout(btcVal, swapOut.PkScript))
+	utxo, err = btc.utxo(txHash, 0, swap.contract)
+	if err != nil {
+		t.Fatalf("case 11 - received error for utxo: %v", err)
+	}
+
+	contract := &Contract{Output: utxo.Output}
+
+	// Now try again with the correct vout.
+	err = contract.auditContract() // sets refund and swap addresses
+	if err != nil {
+		t.Fatalf("case 11 - unexpected error auditing contract: %v", err)
+	}
+	if contract.SwapAddress() != swap.recipient.String() {
+		t.Fatalf("case 11 - wrong recipient. wanted '%s' got '%s'", contract.SwapAddress(), swap.recipient.String())
+	}
+	if contract.RefundAddress() != swap.refund.String() {
+		t.Fatalf("case 11 - wrong recipient. wanted '%s' got '%s'", contract.RefundAddress(), swap.refund.String())
+	}
+	if contract.Value() != 5 {
+		t.Fatalf("case 11 - unexpected output value. wanted 5, got %d", contract.Value())
+	}
+}
+
+func TestRedemption(t *testing.T) {
+	btc, shutdown := testBackend()
+	defer shutdown()
+
+	// The vout will be randomized during reset.
+	txHeight := uint32(32)
+	cleanTestChain()
+	txHash := randomHash()
+	redemptionID := toCoinID(txHash, 0)
+	// blockHash := randomHash()
+	spentHash := randomHash()
+	spentVout := uint32(0)
+	spentID := toCoinID(spentHash, spentVout)
+	verboseTx := testAddTxVerbose(testMakeMsgTx(false).tx, spentHash, nil, 0)
+	verboseTx.Vout = append(verboseTx.Vout, btcjson.Vout{
+		Value: 5,
+	})
+	msg := testMakeMsgTx(false)
+	vin := btcjson.Vin{
+		Txid: spentHash.String(),
+		Vout: spentVout,
+	}
+
+	// A valid mempool redemption.
+	verboseTx = testAddTxVerbose(msg.tx, txHash, nil, 0)
+	verboseTx.Vin = append(verboseTx.Vin, vin)
+	redemption, err := btc.Redemption(redemptionID, spentID)
+	if err != nil {
+		t.Fatalf("Redemption error: %v", err)
+	}
+	confs, err := redemption.Confirmations()
+	if err != nil {
+		t.Fatalf("redemption Confirmations error: %v", err)
+	}
+	if confs != 0 {
+		t.Fatalf("expected 0 confirmations, got %d", confs)
+	}
+
+	// Missing transaction
+	delete(testChain.txRaws, *txHash)
+	_, err = btc.Redemption(redemptionID, spentID)
+	if err == nil {
+		t.Fatalf("No error for missing transaction")
+	}
+
+	// Doesn't spend transaction.
+	verboseTx = testAddTxVerbose(msg.tx, txHash, nil, 0)
+	verboseTx.Vin = append(verboseTx.Vin, btcjson.Vin{
+		Txid: randomHash().String(),
+	})
+	_, err = btc.Redemption(redemptionID, spentID)
+	if err == nil {
+		t.Fatalf("No error for wrong previous outpoint")
+	}
+
+	// Mined transaction.
+	blockHash := randomHash()
+	blockHeight := txHeight - 1
+	verboseTx = testAddTxVerbose(msg.tx, txHash, blockHash, int64(blockHeight))
+	verboseTx.Vin = append(verboseTx.Vin, vin)
+	testAddBlockVerbose(blockHash, nil, 1, blockHeight)
+	redemption, err = btc.Redemption(redemptionID, spentID)
+	if err != nil {
+		t.Fatalf("Redemption with confs error: %v", err)
+	}
+	confs, err = redemption.Confirmations()
+	if err != nil {
+		t.Fatalf("redemption with confs Confirmations error: %v", err)
+	}
+	if confs != 1 {
+		t.Fatalf("expected 1 confirmation, got %d", confs)
 	}
 }
 
@@ -978,8 +1134,13 @@ func TestReorg(t *testing.T) {
 	// Clear the blockchain and set the provided chain to build on the ancestor
 	// block.
 	reset := func() {
+		btc.blockCache.mtx.Lock()
+		defer btc.blockCache.mtx.Unlock()
 		cleanTestChain()
-		btc.blockCache = newBlockCache()
+		newBC := newBlockCache()
+		btc.blockCache.blocks = newBC.blocks
+		btc.blockCache.mainchain = newBC.mainchain
+		btc.blockCache.best = newBC.best
 	}
 	reset()
 
@@ -1016,9 +1177,12 @@ func TestReorg(t *testing.T) {
 			if err != nil {
 				t.Fatalf("error retrieving sidechain block to set confirmations: %v", err)
 			}
-			testChainMtx.Lock()
+			// Set Confirmations
+			btc.blockCache.mtx.Lock() // read from (*blockCache).add in cache.go
+			testChainMtx.Lock()       // field of testChain
 			blk.Confirmations = -1
 			testChainMtx.Unlock()
+			btc.blockCache.mtx.Unlock()
 		}
 	}
 
@@ -1064,127 +1228,63 @@ func TestReorg(t *testing.T) {
 			test(a, b)
 		}
 	}
-}
 
-// TestTx checks the transaction-related methods and functions.
-func TestTx(t *testing.T) {
-	// Create a Backend with the test node.
-	btc, shutdown := testBackend()
-	defer shutdown()
-
-	// Test 1: Test different states of validity.
-	cleanTestChain()
-	blockHeight := uint32(500)
+	// Create a transaction at the tip, then orphan the block and move the
+	// transaction to mempool.
+	reset()
+	setChain(chainA)
+	tipHeight := btc.blockCache.tipHeight()
 	txHash := randomHash()
-	blockHash := randomHash()
+	tip, _ := btc.blockCache.atHeight(tipHeight)
 	msg := testMakeMsgTx(false)
-	verboseTx := testAddTxVerbose(msg.tx, txHash, blockHash, 2)
-	// Mine the transaction and an approving block.
-	testAddBlockVerbose(blockHash, nil, 1, blockHeight)
-	testAddBlockVerbose(randomHash(), nil, 1, blockHeight+1)
-	time.Sleep(blockPollDelay)
-	// Add some random output at index 0.
-	verboseTx.Vout = append(verboseTx.Vout, testVout(1, randomBytes(20)))
-	// Add a swap output at index 1.
-	swap := testMsgTxSwapInit()
-	swapTxOut := swap.tx.TxOut[swap.vout]
-	verboseTx.Vout = append(verboseTx.Vout, testVout(float64(swapTxOut.Value)/btcToSatoshi, swapTxOut.PkScript))
-	// Make an input spending some random utxo.
-	spentTxHash := randomHash()
-	verboseTx.Vin = append(verboseTx.Vin, testVin(spentTxHash, 0))
-	// We need to add that transaction to the blockchain too, because it will
-	// be requested for the previous outpoint value.
-	spentMsg := testMakeMsgTx(false)
-	spentTx := testAddTxVerbose(spentMsg.tx, spentTxHash, blockHash, 2)
-	spentTx.Vout = []btcjson.Vout{testVout(1, nil)}
-	// Get the transaction from the backend.
-	dexTx, err := btc.transaction(txHash)
+	testAddBlockVerbose(&tip.hash, nil, 1, tipHeight)
+	testAddTxOut(msg.tx, 0, txHash, &tip.hash, int64(tipHeight), 1)
+	utxo, err := btc.utxo(txHash, msg.vout, nil)
 	if err != nil {
-		t.Fatalf("error getting dex tx: %v", err)
+		t.Fatalf("utxo error 1: %v", err)
 	}
-	// Check that there are 2 confirmations.
-	confs, err := dexTx.Confirmations()
+	confs, err := utxo.Confirmations()
 	if err != nil {
-		t.Fatalf("unexpected error getting confirmation count: %v", err)
-	}
-	if confs != 2 {
-		t.Fatalf("expected 2 confirmations, but %d were reported", confs)
-	}
-	// Check that the spent tx is in dexTx.
-	spent, err := dexTx.SpendsUTXO(spentTxHash.String(), 0)
-	if err != nil {
-		t.Fatalf("SpendsUTXO error: %v", err)
-	}
-	if !spent {
-		t.Fatalf("transaction not confirming spent utxo")
-	}
-
-	// Check that the swap contract doesn't match the first input.
-	_, _, err = dexTx.AuditContract(0, swap.contract)
-	if err == nil {
-		t.Fatalf("no error for contract audit on non-swap output")
-	}
-	// Now try again with the correct vout.
-	recipient, swapVal, err := dexTx.AuditContract(1, swap.contract)
-	if err != nil {
-		t.Fatalf("unexpected error auditing contract: %v", err)
-	}
-	if recipient != swap.recipient.String() {
-		t.Fatalf("wrong recipient. wanted '%s' got '%s'", recipient, swap.recipient.String())
-	}
-	if swapVal != uint64(swapTxOut.Value) {
-		t.Fatalf("unexpected output value. wanted %d, got %d", swapVal, swapTxOut.Value)
-	}
-
-	// Now do an invalidating reorg, and check that Confirmations returns an
-	// error.
-	testClearBestBlock()
-	testAddBlockVerbose(nil, nil, 1, blockHeight)
-	// Wait for the reorg to be seen by the Backend.loop.
-	time.Sleep(blockPollDelay)
-	_, err = dexTx.Confirmations()
-	if err == nil {
-		t.Fatalf("no error when checking confirmations on an invalidated tx")
-	}
-
-	// Test 2: Before and after mining.
-	cleanTestChain()
-	btc.blockCache = newBlockCache()
-	txHash = randomHash()
-	// Add a transaction to mempool.
-	msg = testMakeMsgTx(false)
-	testAddTxVerbose(msg.tx, txHash, nil, 0)
-	// Get the transaction data through the backend and make sure it has zero
-	// confirmations.
-	dexTx, err = btc.transaction(txHash)
-	if err != nil {
-		t.Fatalf("unexpected error retrieving transaction through backend: %v", err)
-	}
-	confs, err = dexTx.Confirmations()
-	if err != nil {
-		t.Fatalf("unexpected error getting confirmations on mempool transaction: %v", err)
-	}
-	if confs != 0 {
-		t.Fatalf("expected 0 confirmations for mempool transaction, got %d", confs)
-	}
-	// Now mine the transaction
-	blockHash = testAddBlockVerbose(nil, nil, 1, blockHeight)
-	time.Sleep(blockPollDelay)
-	// Update the verbose tx data
-	testAddTxVerbose(msg.tx, txHash, blockHash, 1)
-	// Check Confirmations
-	confs, err = dexTx.Confirmations()
-	if err != nil {
-		t.Fatalf("unexpected error getting confirmations on mined transaction: %v", err)
+		t.Fatalf("Confirmations error: %v", err)
 	}
 	if confs != 1 {
-		t.Fatalf("expected 1 confirmation for mined transaction, got %d", confs)
+		t.Fatalf("wrong number of confirmations. expected 1, got %d", confs)
 	}
-	if dexTx.blockHash != *blockHash {
-		t.Fatalf("unexpected block hash on a mined transaction. expected %s, got %s", blockHash, dexTx.blockHash)
+
+	// Orphan the block and move the transaction to mempool.
+	btc.blockCache.reorg(int64(ancestorHeight))
+	testAddTxOut(msg.tx, 0, txHash, nil, 0, 0)
+	confs, err = utxo.Confirmations()
+	if err != nil {
+		t.Fatalf("Confirmations error after reorg: %v", err)
 	}
-	if dexTx.height != int64(blockHeight) {
-		t.Fatalf("unexpected block height on a mined transaction. expected %d, got %d", blockHeight, dexTx.height)
+	if confs != 0 {
+		t.Fatalf("Expected zero confirmations after reorg, found %d", confs)
+	}
+
+	// Start over, but put it in a lower block instead.
+	reset()
+	setChain(chainA)
+	tip, _ = btc.blockCache.atHeight(tipHeight)
+	testAddBlockVerbose(&tip.hash, nil, 1, tipHeight)
+	testAddTxOut(msg.tx, 0, txHash, &tip.hash, int64(tipHeight), 1)
+	utxo, err = btc.utxo(txHash, msg.vout, nil)
+	if err != nil {
+		t.Fatalf("utxo error 2: %v", err)
+	}
+
+	// Reorg and add a single block with the transaction.
+	btc.blockCache.reorg(int64(ancestorHeight))
+	newBlockHash := randomHash()
+	testAddTxOut(msg.tx, 0, txHash, newBlockHash, int64(ancestorHeight+1), 1)
+	testAddBlockVerbose(newBlockHash, ancestorHash, 1, ancestorHeight+1)
+	time.Sleep(blockPollDelay)
+	confs, err = utxo.Confirmations()
+	if err != nil {
+		t.Fatalf("Confirmations error after reorg to lower block: %v", err)
+	}
+	if confs != 1 {
+		t.Fatalf("Expected zero confirmations after reorg to lower block, found %d", confs)
 	}
 }
 
@@ -1199,23 +1299,41 @@ func TestAuxiliary(t *testing.T) {
 	cleanTestChain()
 	maturity := int64(testParams.CoinbaseMaturity)
 	msg := testMakeMsgTx(false)
+	valueSats := int64(29e6)
+	msg.tx.TxOut[0].Value = valueSats
 	txid := hex.EncodeToString(randomBytes(32))
 	txHash, _ := chainhash.NewHashFromStr(txid)
 	txHeight := rand.Uint32()
 	blockHash := testAddBlockVerbose(nil, nil, 1, txHeight)
 	testAddTxOut(msg.tx, msg.vout, txHash, blockHash, int64(txHeight), maturity)
-	utxo, err := btc.UTXO(txid, msg.vout, nil)
+	coinID := toCoinID(txHash, msg.vout)
+
+	verboseTx := testChain.txRaws[*txHash]
+	vout := btcjson.Vout{
+		Value: 0.29,
+		N:     0,
+		//ScriptPubKey
+	}
+	verboseTx.Vout = append(verboseTx.Vout, vout)
+
+	utxo, err := btc.FundingCoin(coinID, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !bytes.Equal(txHash.CloneBytes(), utxo.TxHash()) {
-		t.Fatalf("utxo tx hash doesn't match")
-	}
-	if utxo.Vout() != msg.vout {
-		t.Fatalf("utxo vout doesn't match")
-	}
 	if utxo.TxID() != txid {
 		t.Fatalf("utxo txid doesn't match")
+	}
+
+	if utxo.(*UTXO).value != uint64(msg.tx.TxOut[0].Value) {
+		t.Errorf("incorrect value. got %d, wanted %d", utxo.(*UTXO).value, msg.tx.TxOut[0].Value)
+	}
+
+	voutVal, err := btc.prevOutputValue(txid, 0)
+	if err != nil {
+		t.Fatalf("prevOutputValue: %v", err)
+	}
+	if voutVal != uint64(msg.tx.TxOut[0].Value) {
+		t.Errorf("incorrect value. got %d, wanted %d", utxo.(*UTXO).value, msg.tx.TxOut[0].Value)
 	}
 }
 
@@ -1244,5 +1362,52 @@ func TestCheckAddress(t *testing.T) {
 		if btc.CheckAddress(test.addr) != !test.wantErr {
 			t.Fatalf("wantErr = %t, address = %s", test.wantErr, test.addr)
 		}
+	}
+}
+
+func TestDriver_DecodeCoinID(t *testing.T) {
+	tests := []struct {
+		name    string
+		coinID  []byte
+		want    string
+		wantErr bool
+	}{
+		{
+			"ok",
+			[]byte{
+				0x16, 0x8f, 0x34, 0x3a, 0xdf, 0x17, 0xe0, 0xc3,
+				0xa2, 0xe8, 0x88, 0x79, 0x8, 0x87, 0x17, 0xb8,
+				0xac, 0x93, 0x47, 0xb9, 0x66, 0xd, 0xa7, 0x4b,
+				0xde, 0x3e, 0x1d, 0x1f, 0x47, 0x94, 0x9f, 0xdf, // 32 byte hash
+				0x0, 0x0, 0x0, 0x1, // 4 byte vout
+			},
+			"df9f94471f1d3ede4ba70d66b94793acb81787087988e8a2c3e017df3a348f16:1",
+			false,
+		},
+		{
+			"bad",
+			[]byte{
+				0x16, 0x8f, 0x34, 0x3a, 0xdf, 0x17, 0xe0, 0xc3,
+				0xa2, 0xe8, 0x88, 0x79, 0x8, 0x87, 0x17, 0xb8,
+				0xac, 0x93, 0x47, 0xb9, 0x66, 0xd, 0xa7, 0x4b,
+				0xde, 0x3e, 0x1d, 0x1f, 0x47, 0x94, 0x9f, // 31 bytes
+				0x0, 0x0, 0x0, 0x1,
+			},
+			"",
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Driver{}
+			got, err := d.DecodeCoinID(tt.coinID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Driver.DecodeCoinID() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("Driver.DecodeCoinID() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
